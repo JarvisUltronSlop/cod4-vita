@@ -1,0 +1,46 @@
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -50,6 +50,24 @@
+ void vglCod4CacheEnable(GLboolean enabled) { cod4_cache_enabled = enabled; }
+ static void cod4_cache_event(unsigned event, unsigned start, unsigned bytes) {
+     if (vglCod4CacheEvent) vglCod4CacheEvent(event, sceKernelGetProcessTimeLow() - start, bytes);
++}
++// The compiler buffer may include up to three trailing alignment bytes.
++// GXM declares the semantic program size; both lengths are checksum protected.
++// Admit only an exact payload or its four-byte rounded size, never arbitrary
++// trailing data. Validate the declared extent before asking GXM to inspect it.
++static GLboolean cod4_cache_program_valid(const void *program, size_t stored) {
++    unsigned start=sceKernelGetProcessTimeLow();
++    if(!program || stored<64 || stored>4u*1024u*1024u)return GL_FALSE;
++    const size_t declared=sceGxmProgramGetSize(program);
++    if(declared<64 || declared>stored
++        || (stored!=declared && stored!=((declared+3u)&~(size_t)3u))) {
++        cod4_cache_event(8,start,(unsigned)declared);return GL_FALSE;
++    }
++    if(sceGxmProgramCheck(program)!=0) {
++        cod4_cache_event(9,start,0);return GL_FALSE;
++    }
++    if(stored!=declared)cod4_cache_event(7,start,(unsigned)(stored-declared));
++    return GL_TRUE;
+ }
+ typedef struct {uint32_t magic,version,bytes,kind;uint64_t checksum;} cod4_cache_header;
+ static void cod4_cache_reject(const char *path) {
+@@ -75,8 +93,7 @@
+         && VITAGL_XXH3_64bits(data,header.bytes) == header.checksum;
+     else valid = GL_FALSE;
+     sceIoClose(file);
+-    if (valid && kind == 0) valid = header.bytes >= 64
+-        && sceGxmProgramGetSize(data) == header.bytes && sceGxmProgramCheck(data) == 0;
++    if (valid && kind == 0) valid = cod4_cache_program_valid(data,header.bytes);
+     if (!valid) {
+         if (data) vgl_free(data);
+         cod4_cache_reject(path);cod4_cache_event(3,start,0);return NULL;
+@@ -659,7 +676,7 @@
+     SceGxmProgram *program=vglMalloc(sz-offset);
+     if(!program)return GL_FALSE;
+     vgl_fast_memcpy(program,(uint8_t *)in+offset,sz-offset);
+-    if(sceGxmProgramGetSize(program)!=sz-offset || sceGxmProgramCheck(program)!=0) {vgl_free(program);return GL_FALSE;}
++    if(!cod4_cache_program_valid(program,sz-offset)) {vgl_free(program);return GL_FALSE;}
+     uint32_t parameters=sceGxmProgramGetParameterCount(program);
+     matrix_uniform *matrices=NULL;
+     for(uint32_t i=0;i<count;++i) {

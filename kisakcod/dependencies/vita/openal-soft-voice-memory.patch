@@ -1,0 +1,103 @@
+--- a/Alc/ALc.c
++++ b/Alc/ALc.c
+@@ -2319,7 +2319,14 @@
+             vprops = next;
+         }
+ 
+-        AllocateVoices(context, context->MaxVoices, old_sends);
++        if(!AllocateVoices(context, context->MaxVoices, old_sends))
++        {
++            almtx_unlock(&context->SourceLock);
++            almtx_unlock(&context->PropLock);
++            update_failed = AL_TRUE;
++            /* The common exit restores mixer mode and rejects this device. */
++            break;
++        }
+         for(pos = 0;pos < context->VoiceCount;pos++)
+         {
+             ALvoice *voice = context->Voices[pos];
+@@ -2904,7 +2911,7 @@
+ }
+ 
+ 
+-void AllocateVoices(ALCcontext *context, ALsizei num_voices, ALsizei old_sends)
++bool AllocateVoices(ALCcontext *context, ALsizei num_voices, ALsizei old_sends)
+ {
+     ALCdevice *device = context->Device;
+     ALsizei num_sends = device->NumAuxSends;
+@@ -2917,7 +2924,7 @@
+     size_t size;
+ 
+     if(num_voices == context->MaxVoices && num_sends == old_sends)
+-        return;
++        return true;
+ 
+     /* Allocate the voice pointers, voices, and the voices' stored source
+      * property set (including the dynamically-sized Send[] array) in one
+@@ -2927,7 +2934,11 @@
+     sizeof_props = RoundUp(FAM_SIZE(struct ALvoiceProps, Send, num_sends), 16);
+     size = sizeof(ALvoice*) + sizeof_voice + sizeof_props;
+ 
++    if(num_voices <= 0 || (size_t)num_voices > (SIZE_MAX-15)/size)
++        return false;
+     voices = al_calloc(16, RoundUp(size*num_voices, 16));
++    if(!voices)
++        return false; /* Leave the old pool owned and untouched. */
+     /* The voice and property objects are stored interleaved since they're
+      * paired together.
+      */
+@@ -2986,6 +2997,7 @@
+     context->Voices = voices;
+     context->MaxVoices = num_voices;
+     context->VoiceCount = mini(context->VoiceCount, num_voices);
++    return true;
+ }
+ 
+ 
+@@ -3830,7 +3842,18 @@
+         ALCdevice_DecRef(device);
+         return NULL;
+     }
+-    AllocateVoices(ALContext, 256, device->NumAuxSends);
++    /* The Vita source driver exposes 53 channels. Reserve 64 voices rather
++     * than 256; alSourcePlayv still grows this pool when needed. This changes
++     * unused reservation, not the source limit, mixer or sample quality.
++     */
++    if(!AllocateVoices(ALContext, 64, device->NumAuxSends))
++    {
++        almtx_unlock(&device->BackendLock);
++        al_free(ALContext);
++        alcSetError(device, ALC_OUT_OF_MEMORY);
++        ALCdevice_DecRef(device);
++        return NULL;
++    }
+ 
+     if(DefaultEffect.type != AL_EFFECT_NULL && device->Type == Playback)
+     {
+--- a/OpenAL32/Include/alMain.h
++++ b/OpenAL32/Include/alMain.h
+@@ -861,7 +861,7 @@
+ void ALCcontext_DeferUpdates(ALCcontext *context);
+ void ALCcontext_ProcessUpdates(ALCcontext *context);
+ 
+-void AllocateVoices(ALCcontext *context, ALsizei num_voices, ALsizei old_sends);
++bool AllocateVoices(ALCcontext *context, ALsizei num_voices, ALsizei old_sends);
+ 
+ 
+ extern ALint RTPrioLevel;
+--- a/OpenAL32/alSource.c
++++ b/OpenAL32/alSource.c
+@@ -2415,7 +2415,12 @@
+             SETERR_GOTO(context, AL_OUT_OF_MEMORY, done,
+                         "Overflow increasing voice count %d -> %d", context->MaxVoices, newcount);
+         }
+-        AllocateVoices(context, newcount, device->NumAuxSends);
++        if(!AllocateVoices(context, newcount, device->NumAuxSends))
++        {
++            ALCdevice_Unlock(device);
++            SETERR_GOTO(context, AL_OUT_OF_MEMORY, done,
++                        "Failed increasing voice count %d -> %d", context->MaxVoices, newcount);
++        }
+     }
+ 
+     for(i = 0;i < n;i++)

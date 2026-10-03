@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "baseRevision": "3d035da150549cb38a83811f75856a121754cd5d",
+  "basePaddingPatchSha256": "a7a6aab476129fdc6c43ae475e2741dbbf2d6dcc18db883fd8b8438fbb151c28",
+  "patch": "vitagl-cpu-shader-failure.patch",
+  "patchSha256": "860414042f58053131a61e6ec22eab438905434f05d230580d14c793488f88fd",
+  "cacheFormat": 1,
+  "successfulShaderCodeChanged": false,
+  "reason": "Preserve VitaShaRK source-length input/output contract, fail closed before serialization/linking, and capture bounded compiler diagnostics with transactional cleanup."
+}

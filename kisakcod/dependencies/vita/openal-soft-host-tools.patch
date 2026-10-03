@@ -1,0 +1,25 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1305,6 +1305,14 @@
+ ENDIF()
+ 
+ SET(NATIVE_SRC_DIR  "${OpenAL_SOURCE_DIR}/native-tools/")
++IF(KISAK_OPENAL_NATIVE_TOOLS_DIR)
++    SET(NATIVE_BIN_DIR "${KISAK_OPENAL_NATIVE_TOOLS_DIR}/")
++    IF(CMAKE_HOST_WIN32)
++        SET(NATIVE_EXE_SUFFIX ".exe")
++    ENDIF()
++    SET(BIN2H_COMMAND "${NATIVE_BIN_DIR}bin2h${NATIVE_EXE_SUFFIX}")
++    SET(BSINCGEN_COMMAND "${NATIVE_BIN_DIR}bsincgen${NATIVE_EXE_SUFFIX}")
++ELSE()
+ SET(NATIVE_BIN_DIR  "${OpenAL_BINARY_DIR}/native-tools/")
+ FILE(MAKE_DIRECTORY "${NATIVE_BIN_DIR}")
+ 
+@@ -1320,6 +1328,7 @@
+                      C "${NATIVE_SRC_DIR}bsincgen.c"
+     VERBATIM
+ )
++ENDIF()
+ ADD_CUSTOM_TARGET(native-tools
+     DEPENDS "${BIN2H_COMMAND}" "${BSINCGEN_COMMAND}"
+     VERBATIM

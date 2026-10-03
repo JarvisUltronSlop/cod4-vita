@@ -1,0 +1,824 @@
+diff --git a/Alc/ALc.c b/Alc/ALc.c
+index 8bf2e1da..8b3b1fa5 100644
+--- a/Alc/ALc.c
++++ b/Alc/ALc.c
+@@ -105,6 +105,9 @@ static struct BackendInfo BackendList[] = {
+ #ifdef HAVE_SDL2
+     { "sdl2", ALCsdl2BackendFactory_getFactory },
+ #endif
++#ifdef HAVE_VITA
++    { "vita", ALCvitaBackendFactory_getFactory },
++#endif
+ 
+     { "null", ALCnullBackendFactory_getFactory },
+ #ifdef HAVE_WAVE
+diff --git a/Alc/alconfig.c b/Alc/alconfig.c
+index 3d0ed140..4e1e6803 100644
+--- a/Alc/alconfig.c
++++ b/Alc/alconfig.c
+@@ -420,6 +420,29 @@ void ReadALConfig(void)
+ 
+     alstr_reset(&ppath);
+ }
++#elif defined __vita__
++void ReadALConfig(void)
++{
++    const char* config_paths[] =
++    {
++        "app0:/alsoft.conf",
++        "ux0:/data/openal/alsoft.conf"
++    };
++
++    FILE* f;
++    unsigned int i;
++    for(i = 0; i < sizeof(config_paths) / sizeof(*config_paths); ++i)
++    {
++        TRACE("Loading config %s...\n", config_paths[i]);
++        f = al_fopen(config_paths[i], "r");
++        if(f)
++        {
++            LoadConfigFromFile(f);
++            fclose(f);
++            break;
++        }
++    }
++}
+ #else
+ void ReadALConfig(void)
+ {
+diff --git a/Alc/backends/base.h b/Alc/backends/base.h
+index 03db56e9..74b75c45 100644
+--- a/Alc/backends/base.h
++++ b/Alc/backends/base.h
+@@ -150,6 +150,7 @@ ALCbackendFactory *ALCdsoundBackendFactory_getFactory(void);
+ ALCbackendFactory *ALCwinmmBackendFactory_getFactory(void);
+ ALCbackendFactory *ALCportBackendFactory_getFactory(void);
+ ALCbackendFactory *ALCopenslBackendFactory_getFactory(void);
++ALCbackendFactory *ALCvitaBackendFactory_getFactory(void);
+ ALCbackendFactory *ALCnullBackendFactory_getFactory(void);
+ ALCbackendFactory *ALCwaveBackendFactory_getFactory(void);
+ ALCbackendFactory *ALCsdl2BackendFactory_getFactory(void);
+diff --git a/Alc/backends/vita.c b/Alc/backends/vita.c
+new file mode 100644
+index 00000000..f7c5d262
+--- /dev/null
++++ b/Alc/backends/vita.c
+@@ -0,0 +1,513 @@
++/**
++ * OpenAL cross platform audio library
++ * Copyright (C) 2018 by authors.
++ * This library is free software; you can redistribute it and/or
++ *  modify it under the terms of the GNU Library General Public
++ *  License as published by the Free Software Foundation; either
++ *  version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ *  License along with this library; if not, write to the
++ *  Free Software Foundation, Inc.,
++ *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ * Or go to http://www.gnu.org/copyleft/lgpl.html
++ */
++
++#include "config.h"
++
++#include <psp2/audioin.h>
++#include <psp2/audioout.h>
++#include <stdlib.h>
++
++#include "alMain.h"
++#include "alu.h"
++#include "ringbuffer.h"
++#include "threads.h"
++
++#include "backends/base.h"
++
++#define AUDIO_SAMPLE_ALIGN(s)   (((s) + 63) & ~63)
++
++static const ALCchar playbackDeviceName[] = "PS Vita Speakers/Headphones";
++static const ALCchar captureDeviceName[] = "PS Vita Microphone";
++
++extern unsigned int _oal_thread_priority __attribute__((weak));
++extern unsigned int _oal_thread_affinity __attribute__((weak));
++
++// -----------------------------------------------------------------------------
++// Playback
++// -----------------------------------------------------------------------------
++typedef struct ALCvitaPlayback
++{
++    DERIVE_FROM_TYPE(ALCbackend);
++
++    ATOMIC(int) killNow;
++    SceUID thread;
++    SceKernelLwMutexWork lock;
++
++    int portNumber;
++    ALsizei frameSize;
++    void* waveBuffer;
++
++    ALuint Frequency;
++    enum DevFmtChannels FmtChans;
++    enum DevFmtType     FmtType;
++    ALuint UpdateSize;
++} ALCvitaPlayback;
++
++static void ALCvitaPlayback_Construct(ALCvitaPlayback *self, ALCdevice *device);
++static void ALCvitaPlayback_Destruct(ALCvitaPlayback *self);
++static ALCenum ALCvitaPlayback_open(ALCvitaPlayback *self, const ALCchar *name);
++static ALCboolean ALCvitaPlayback_reset(ALCvitaPlayback *self);
++static ALCboolean ALCvitaPlayback_start(ALCvitaPlayback *self);
++static void ALCvitaPlayback_stop(ALCvitaPlayback *self);
++static void ALCvitaPlayback_lock(ALCvitaPlayback *self);
++static void ALCvitaPlayback_unlock(ALCvitaPlayback *self);
++
++static DECLARE_FORWARD2(ALCvitaPlayback, ALCbackend, ALCenum, captureSamples, void*, ALCuint)
++static DECLARE_FORWARD(ALCvitaPlayback, ALCbackend, ALCuint, availableSamples)
++static DECLARE_FORWARD(ALCvitaPlayback, ALCbackend, ClockLatency, getClockLatency)
++DECLARE_DEFAULT_ALLOCATORS(ALCvitaPlayback)
++
++DEFINE_ALCBACKEND_VTABLE(ALCvitaPlayback);
++
++static void ALCvitaPlayback_Construct(ALCvitaPlayback *self, ALCdevice *device)
++{
++    ALCbackend_Construct(STATIC_CAST(ALCbackend, self), device);
++    SET_VTABLE2(ALCvitaPlayback, ALCbackend, self);
++
++    device->UpdateSize = AUDIO_SAMPLE_ALIGN(device->UpdateSize);
++
++    self->portNumber = 0;
++    self->frameSize = FrameSizeFromDevFmt(device->FmtChans, device->FmtType, device->AmbiOrder);
++    self->Frequency = device->Frequency;
++    self->FmtChans = device->FmtChans;
++    self->FmtType = device->FmtType;
++    self->UpdateSize = device->UpdateSize;
++
++    sceKernelCreateLwMutex(
++        &self->lock,
++        "OpenAL Vita playback mutex",
++        SCE_KERNEL_MUTEX_ATTR_RECURSIVE, // No SCE_KERNEL_LW_MUTEX_ATTR_RECURSIVE in VitaSDK, but it's the same
++        0,
++        NULL
++    );
++}
++
++static void ALCvitaPlayback_Destruct(ALCvitaPlayback *self)
++{
++    if (self->portNumber)
++    {
++        sceAudioOutReleasePort(self->portNumber);
++        self->portNumber = 0;
++    }
++
++    if (self->waveBuffer)
++    {
++        free(self->waveBuffer);
++        self->waveBuffer = NULL;
++    }
++
++    sceKernelDeleteLwMutex(&self->lock);
++
++    ALCbackend_Destruct(STATIC_CAST(ALCbackend, self));
++}
++
++static int ALCvitaPlayback_MixerProc(SceSize args, void *argp)
++{
++    (void)args;
++    ALCvitaPlayback *self = *(ALCvitaPlayback **) argp;
++    ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
++
++    while (!ATOMIC_LOAD(&self->killNow, almemory_order_acquire))
++    {
++        ALCvitaPlayback_lock(self);
++        aluMixData(device, self->waveBuffer, device->UpdateSize);
++        ALCvitaPlayback_unlock(self);
++        sceAudioOutOutput(self->portNumber, self->waveBuffer);
++    }
++
++    return 0;
++}
++
++static ALCenum ALCvitaPlayback_open(ALCvitaPlayback *self, const ALCchar *name)
++{
++    ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
++
++    /* Only signed short output sample format is supported */
++    device->FmtType = DevFmtShort;
++
++    /* Only mono/stereo channel configurations are supported */
++    if (device->FmtChans != DevFmtMono && device->FmtChans != DevFmtStereo)
++        device->FmtChans = DevFmtStereo;
++
++    device->UpdateSize = AUDIO_SAMPLE_ALIGN(device->UpdateSize);
++
++    self->portNumber = sceAudioOutOpenPort(
++        SCE_AUDIO_OUT_PORT_TYPE_BGM,
++        device->UpdateSize,
++        device->Frequency,
++        device->FmtChans == DevFmtStereo ? SCE_AUDIO_OUT_MODE_STEREO : SCE_AUDIO_OUT_MODE_MONO
++    );
++
++    if (self->portNumber < 0)
++        return ALC_INVALID_VALUE;
++
++
++    self->frameSize = FrameSizeFromDevFmt(device->FmtChans, device->FmtType, device->AmbiOrder);
++    self->Frequency = device->Frequency;
++    self->FmtChans = device->FmtChans;
++    self->FmtType = device->FmtType;
++    self->UpdateSize = device->UpdateSize;
++
++    self->waveBuffer = calloc(device->UpdateSize * self->frameSize, 1);
++
++    alstr_copy_cstr(&device->DeviceName, name ? name : playbackDeviceName);
++
++    return ALC_NO_ERROR;
++}
++
++static ALCboolean ALCvitaPlayback_reset(ALCvitaPlayback *self)
++{
++    ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
++
++    if (device->FmtChans != DevFmtMono && device->FmtChans != DevFmtStereo)
++        device->FmtChans = DevFmtStereo;
++
++    device->UpdateSize = AUDIO_SAMPLE_ALIGN(device->UpdateSize);
++
++    sceAudioOutSetConfig(
++        self->portNumber,
++        device->UpdateSize,
++        device->Frequency,
++        device->FmtChans == DevFmtStereo ? SCE_AUDIO_OUT_MODE_STEREO : SCE_AUDIO_OUT_MODE_MONO
++    );
++
++    self->frameSize = FrameSizeFromDevFmt(device->FmtChans, device->FmtType, device->AmbiOrder);
++    self->Frequency = device->Frequency;
++    self->FmtChans = device->FmtChans;
++    self->FmtType = device->FmtType;
++    self->UpdateSize = device->UpdateSize;
++
++    if (self->waveBuffer)
++    {
++        free(self->waveBuffer);
++    }
++
++    self->waveBuffer = calloc(device->UpdateSize * self->frameSize, 1);
++
++    SetDefaultWFXChannelOrder(device);
++
++    return ALC_TRUE;
++}
++
++static ALCboolean ALCvitaPlayback_start(ALCvitaPlayback *self)
++{
++    ATOMIC_STORE(&self->killNow, AL_FALSE, almemory_order_release);
++
++    int priority = 128; // middle
++    int affinity = 0; // DEFAULT
++    int stack_size = 0x10000; // 64Kib
++
++    if (&_oal_thread_priority != NULL) {
++        priority = _oal_thread_priority;
++    } else {
++        SceKernelThreadInfo info;
++        info.size = sizeof(SceKernelThreadInfo);
++        if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) == 0) {
++            priority = info.currentPriority - 1;
++        }
++    }
++
++    if (priority < 64 && priority != 0) priority = 64;
++    if (priority > 191) priority = 191;
++
++    if (&_oal_thread_affinity != NULL) {
++        affinity = _oal_thread_affinity;
++    }
++
++    self->thread = sceKernelCreateThread("OpenAL Vita playback thread", ALCvitaPlayback_MixerProc,
++                           priority, stack_size, 0, affinity, NULL);
++
++    if (self->thread < 0)
++        return ALC_FALSE;
++
++    int ret = sceKernelStartThread(self->thread, 4, &self);
++    if (ret < 0)
++        return ALC_FALSE;
++
++    return ALC_TRUE;
++}
++
++static void ALCvitaPlayback_stop(ALCvitaPlayback *self)
++{
++    if (ATOMIC_EXCHANGE(&self->killNow, AL_TRUE, almemory_order_acq_rel))
++        return;
++
++    sceKernelWaitThreadEnd(self->thread, NULL, NULL);
++    sceKernelDeleteThread(self->thread);
++}
++
++static void ALCvitaPlayback_lock(ALCvitaPlayback *self)
++{
++    sceKernelLockLwMutex(&self->lock, 1, NULL);
++}
++
++static void ALCvitaPlayback_unlock(ALCvitaPlayback *self)
++{
++    sceKernelUnlockLwMutex(&self->lock, 1);
++}
++
++// -----------------------------------------------------------------------------
++// Capture
++// -----------------------------------------------------------------------------
++typedef struct ALCvitaCapture
++{
++    DERIVE_FROM_TYPE(ALCbackend);
++
++    ATOMIC(int) killNow;
++    althrd_t thread;
++    SceKernelLwMutexWork lock;
++
++    int portNumber;
++    ALsizei frameSize;
++    ll_ringbuffer_t *ring;
++
++    ALuint Frequency;
++    enum DevFmtChannels FmtChans;
++    enum DevFmtType     FmtType;
++    ALuint UpdateSize;
++} ALCvitaCapture;
++
++static void ALCvitaCapture_Construct(ALCvitaCapture *self, ALCdevice *device);
++static void ALCvitaCapture_Destruct(ALCvitaCapture *self);
++static ALCenum ALCvitaCapture_open(ALCvitaCapture *self, const ALCchar *name);
++static ALCboolean ALCvitaCapture_reset(ALCvitaCapture *self);
++static ALCboolean ALCvitaCapture_start(ALCvitaCapture *self);
++static void ALCvitaCapture_stop(ALCvitaCapture *self);
++static void ALCvitaCapture_lock(ALCvitaCapture *self);
++static void ALCvitaCapture_unlock(ALCvitaCapture *self);
++static ALCenum ALCvitaCapture_captureSamples(ALCvitaCapture *self, ALCvoid *buffer, ALCuint samples);
++static ALCuint ALCvitaCapture_availableSamples(ALCvitaCapture *self);
++static DECLARE_FORWARD(ALCvitaCapture, ALCbackend, ClockLatency, getClockLatency)
++DECLARE_DEFAULT_ALLOCATORS(ALCvitaCapture)
++
++DEFINE_ALCBACKEND_VTABLE(ALCvitaCapture);
++
++static void ALCvitaCapture_Construct(ALCvitaCapture *self, ALCdevice *device)
++{
++    ALCbackend_Construct(STATIC_CAST(ALCbackend, self), device);
++    SET_VTABLE2(ALCvitaCapture, ALCbackend, self);
++
++    self->portNumber = 0;
++    self->frameSize = FrameSizeFromDevFmt(device->FmtChans, device->FmtType, device->AmbiOrder);
++    self->Frequency = device->Frequency;
++    self->FmtChans = device->FmtChans;
++    self->FmtType = device->FmtType;
++    self->UpdateSize = device->UpdateSize;
++}
++
++static void ALCvitaCapture_Destruct(ALCvitaCapture *self)
++{
++    if (self->portNumber)
++    {
++        sceAudioOutReleasePort(self->portNumber);
++        self->portNumber = 0;
++    }
++
++    if (self->ring)
++    {
++        ll_ringbuffer_free(self->ring);
++        self->ring = NULL;
++    }
++
++    ALCbackend_Destruct(STATIC_CAST(ALCbackend, self));
++}
++
++static int ALCvitaCapture_MixerProc(void *ptr)
++{
++    ALCvitaCapture *self = (ALCvitaCapture*)ptr;
++    ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
++
++    void* buf = malloc(self->frameSize * device->UpdateSize);
++
++    while (!ATOMIC_LOAD(&self->killNow, almemory_order_acquire))
++    {
++        sceAudioInInput(self->portNumber, buf);
++        ll_ringbuffer_write(self->ring, buf, self->frameSize * device->UpdateSize);
++    }
++
++    free(buf);
++
++    return 0;
++}
++
++static ALCenum ALCvitaCapture_open(ALCvitaCapture *self, const ALCchar *name)
++{
++    ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
++
++    /* Only signed short output sample format is supported */
++    device->FmtType = DevFmtShort;
++
++    /* Only mono channel configuration is supported */
++    if (device->FmtChans != DevFmtMono)
++        device->FmtChans = DevFmtMono;
++
++    /* TODO: Validate samplerate and update size */
++
++    self->portNumber = sceAudioInOpenPort(
++        SCE_AUDIO_IN_PORT_TYPE_RAW,
++        device->UpdateSize,
++        device->Frequency,
++        SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO
++    );
++
++    if (self->portNumber < 0)
++    {
++        return ALC_INVALID_VALUE;
++    }
++
++    self->frameSize = FrameSizeFromDevFmt(device->FmtChans, device->FmtType, device->AmbiOrder);
++    self->Frequency = device->Frequency;
++    self->FmtChans = device->FmtChans;
++    self->FmtType = device->FmtType;
++    self->UpdateSize = device->UpdateSize;
++
++    self->ring = ll_ringbuffer_create(device->UpdateSize * device->NumUpdates, self->frameSize, false);
++    if (self->ring == NULL)
++        return ALC_INVALID_VALUE;
++
++    alstr_copy_cstr(&device->DeviceName, name ? name : captureDeviceName);
++
++    return ALC_NO_ERROR;
++}
++
++static ALCboolean ALCvitaCapture_reset(ALCvitaCapture *self)
++{
++    ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
++    SetDefaultWFXChannelOrder(device);
++    return ALC_TRUE;
++}
++
++static ALCboolean ALCvitaCapture_start(ALCvitaCapture *self)
++{
++    ATOMIC_STORE(&self->killNow, AL_FALSE, almemory_order_release);
++    if (althrd_create(&self->thread, ALCvitaCapture_MixerProc, self) != althrd_success)
++        return ALC_FALSE;
++
++    return ALC_TRUE;
++}
++
++static void ALCvitaCapture_stop(ALCvitaCapture *self)
++{
++    int res;
++
++    if (ATOMIC_EXCHANGE(&self->killNow, AL_TRUE, almemory_order_acq_rel))
++        return;
++
++    althrd_join(self->thread, &res);
++}
++
++static void ALCvitaCapture_lock(ALCvitaCapture *self)
++{
++    sceKernelLockLwMutex(&self->lock, 1, NULL);
++}
++
++static void ALCvitaCapture_unlock(ALCvitaCapture *self)
++{
++    sceKernelUnlockLwMutex(&self->lock, 1);
++}
++
++
++static ALCuint ALCvitaCapture_availableSamples(ALCvitaCapture *self)
++{
++    return ll_ringbuffer_read_space(self->ring);
++}
++
++static ALCenum ALCvitaCapture_captureSamples(ALCvitaCapture *self, ALCvoid *buffer, ALCuint samples)
++{
++    ll_ringbuffer_read(self->ring, buffer, samples);
++    return ALC_NO_ERROR;
++}
++
++// -----------------------------------------------------------------------------
++// Backends
++// -----------------------------------------------------------------------------
++
++typedef struct ALCvitaBackendFactory {
++    DERIVE_FROM_TYPE(ALCbackendFactory);
++} ALCvitaBackendFactory;
++#define ALCvitaBACKENDFACTORY_INITIALIZER { { GET_VTABLE2(ALCvitaBackendFactory, ALCbackendFactory) } }
++
++ALCbackendFactory *ALCvitaBackendFactory_getFactory(void);
++
++static ALCboolean ALCvitaBackendFactory_init(ALCvitaBackendFactory *self);
++static void ALCvitaBackendFactory_deinit(ALCvitaBackendFactory *self);
++static ALCboolean ALCvitaBackendFactory_querySupport(ALCvitaBackendFactory *self, ALCbackend_Type type);
++static void ALCvitaBackendFactory_probe(ALCvitaBackendFactory *self, enum DevProbe type, al_string *outnames);
++static ALCbackend* ALCvitaBackendFactory_createBackend(ALCvitaBackendFactory *self, ALCdevice *device, ALCbackend_Type type);
++
++DEFINE_ALCBACKENDFACTORY_VTABLE(ALCvitaBackendFactory);
++
++ALCbackendFactory *ALCvitaBackendFactory_getFactory(void)
++{
++    static ALCvitaBackendFactory factory = ALCvitaBACKENDFACTORY_INITIALIZER;
++    return STATIC_CAST(ALCbackendFactory, &factory);
++}
++
++
++static ALCboolean ALCvitaBackendFactory_init(ALCvitaBackendFactory* UNUSED(self))
++{
++    return AL_TRUE;
++}
++
++static void ALCvitaBackendFactory_deinit(ALCvitaBackendFactory* UNUSED(self))
++{
++}
++
++static ALCboolean ALCvitaBackendFactory_querySupport(ALCvitaBackendFactory* UNUSED(self), ALCbackend_Type type)
++{
++    if (type == ALCbackend_Playback || type == ALCbackend_Capture)
++        return ALC_TRUE;
++
++    return ALC_FALSE;
++}
++
++static void ALCvitaBackendFactory_probe(ALCvitaBackendFactory* UNUSED(self), enum DevProbe type, al_string *outnames)
++{
++    if (type == ALL_DEVICE_PROBE)
++        alstr_append_range(outnames, playbackDeviceName, playbackDeviceName+sizeof(playbackDeviceName));
++    else if (type == CAPTURE_DEVICE_PROBE)
++        alstr_append_range(outnames, captureDeviceName, playbackDeviceName+sizeof(captureDeviceName));
++}
++
++static ALCbackend* ALCvitaBackendFactory_createBackend(ALCvitaBackendFactory* UNUSED(self), ALCdevice *device, ALCbackend_Type type)
++{
++    if (type == ALCbackend_Playback)
++    {
++        ALCvitaPlayback *backend;
++        NEW_OBJ(backend, ALCvitaPlayback)(device);
++
++        if (!backend)
++            return NULL;
++
++        return STATIC_CAST(ALCbackend, backend);
++    }
++
++    if (type == ALCbackend_Capture)
++    {
++        ALCvitaCapture *backend;
++        NEW_OBJ(backend, ALCvitaCapture)(device);
++
++        if (!backend)
++            return NULL;
++
++        return STATIC_CAST(ALCbackend, backend);
++    }
++    return NULL;
++}
+diff --git a/Alc/bformatdec.h b/Alc/bformatdec.h
+index 2d7d1d62..d2160793 100644
+--- a/Alc/bformatdec.h
++++ b/Alc/bformatdec.h
+@@ -24,9 +24,9 @@
+ /* NOTE: These are scale factors as applied to Ambisonics content. Decoder
+  * coefficients should be divided by these values to get proper N3D scalings.
+  */
+-const ALfloat N3D2N3DScale[MAX_AMBI_COEFFS];
+-const ALfloat SN3D2N3DScale[MAX_AMBI_COEFFS];
+-const ALfloat FuMa2N3DScale[MAX_AMBI_COEFFS];
++extern const ALfloat N3D2N3DScale[MAX_AMBI_COEFFS];
++extern const ALfloat SN3D2N3DScale[MAX_AMBI_COEFFS];
++extern const ALfloat FuMa2N3DScale[MAX_AMBI_COEFFS];
+ 
+ 
+ struct AmbDecConf;
+diff --git a/Alc/helpers.c b/Alc/helpers.c
+index d2cb6253..1815dcfc 100644
+--- a/Alc/helpers.c
++++ b/Alc/helpers.c
+@@ -102,7 +102,9 @@ DEFINE_PROPERTYKEY(PKEY_AudioEndpoint_GUID, 0x1da5d803, 0xd492, 0x4edd, 0x8c, 0x
+ #ifndef _WIN32
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#ifndef __vita__
+ #include <sys/mman.h>
++#endif
+ #include <fcntl.h>
+ #include <unistd.h>
+ #elif defined(_WIN32_IE)
+@@ -218,6 +220,9 @@ void FillCPUCaps(int capfilter)
+ #endif
+ #endif
+ #ifdef HAVE_NEON
++#ifdef __vita__
++    caps |= CPU_CAP_NEON;
++#else
+     FILE *file = fopen("/proc/cpuinfo", "rt");
+     if(!file)
+         ERR("Failed to open /proc/cpuinfo, cannot check for NEON support\n");
+@@ -262,6 +267,7 @@ void FillCPUCaps(int capfilter)
+ 
+         alstr_reset(&features);
+     }
++#endif
+ #endif
+ 
+     TRACE("Extensions:%s%s%s%s%s%s\n",
+@@ -680,6 +686,11 @@ void UnmapFileMem(const struct FileMapping *mapping)
+ 
+ void GetProcBinary(al_string *path, al_string *fname)
+ {
++#ifdef __vita__
++    if(path) alstr_copy_cstr(path, "app0:/");
++    if(fname) alstr_copy_cstr(fname, "eboot.bin");
++
++#else
+     char *pathname = NULL;
+     size_t pathlen;
+ 
+@@ -770,7 +781,7 @@ void GetProcBinary(al_string *path, al_string *fname)
+         if(fname) alstr_copy_cstr(fname, pathname);
+     }
+     free(pathname);
+-
++#endif
+     if(path && fname)
+         TRACE("Got: %s, %s\n", alstr_get_cstr(*path), alstr_get_cstr(*fname));
+     else if(path) TRACE("Got path: %s\n", alstr_get_cstr(*path));
+@@ -871,6 +882,10 @@ vector_al_string SearchDataFiles(const char *ext, const char *subdir)
+     while(ATOMIC_EXCHANGE_SEQ(&search_lock, 1) == 1)
+         althrd_yield();
+ 
++#ifdef __vita__
++    DirectorySearch(subdir, ext, &results);
++#else
++
+     if(subdir[0] == '/')
+         DirectorySearch(subdir, ext, &results);
+     else
+@@ -953,7 +968,7 @@ vector_al_string SearchDataFiles(const char *ext, const char *subdir)
+ 
+         alstr_reset(&path);
+     }
+-
++#endif
+     ATOMIC_STORE_SEQ(&search_lock, 0);
+ 
+     return results;
+@@ -980,6 +995,10 @@ struct FileMapping MapFileToMem(const char *fname)
+         return ret;
+     }
+ 
++#ifdef __vita__
++    ptr = malloc(sbuf.st_size);
++    read(fd, ptr, sbuf.st_size);
++#else
+     ptr = mmap(NULL, sbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+     if(ptr == MAP_FAILED)
+     {
+@@ -987,7 +1006,7 @@ struct FileMapping MapFileToMem(const char *fname)
+         close(fd);
+         return ret;
+     }
+-
++#endif
+     ret.fd = fd;
+     ret.ptr = ptr;
+     ret.len = sbuf.st_size;
+@@ -996,7 +1015,11 @@ struct FileMapping MapFileToMem(const char *fname)
+ 
+ void UnmapFileMem(const struct FileMapping *mapping)
+ {
++#ifdef __vita__
++    free(mapping->ptr);
++#else
+     munmap(mapping->ptr, mapping->len);
++#endif
+     close(mapping->fd);
+ }
+ 
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 39b80250..c8a2525b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ # CMake build file list for OpenAL
+ 
+-CMAKE_MINIMUM_REQUIRED(VERSION 3.0.2)
++CMAKE_MINIMUM_REQUIRED(VERSION 3.5)
+ 
+ PROJECT(OpenAL)
+ 
+@@ -61,6 +61,13 @@ if(DEFINED LIB_SUFFIX)
+     message(WARNING "LIB_SUFFIX is deprecated.  Use the variables provided by the GNUInstallDirs module instead")
+ endif()
+ 
++if(VITA)
++    SET(LIBTYPE STATIC)
++    SET(ALSOFT_DLOPEN OFF)
++    SET(ALSOFT_UTILS OFF)
++    SET(ALSOFT_TESTS OFF)
++    SET(ALSOFT_EXAMPLES OFF)
++endif()
+ 
+ SET(CPP_DEFS ) # C pre-process, not C++
+ SET(INC_PATHS )
+@@ -632,9 +639,11 @@ IF(NOT HAVE_WINDOWS_H)
+         MESSAGE(FATAL_ERROR "No timing function found!")
+     ENDIF()
+ 
+-    CHECK_SYMBOL_EXISTS(nanosleep time.h HAVE_NANOSLEEP)
+-    IF(NOT HAVE_NANOSLEEP)
+-        MESSAGE(FATAL_ERROR "No sleep function found!")
++    IF(NOT VITA)
++        CHECK_SYMBOL_EXISTS(nanosleep time.h HAVE_NANOSLEEP)
++        IF(NOT HAVE_NANOSLEEP)
++            MESSAGE(FATAL_ERROR "No sleep function found!")
++        ENDIF()
+     ENDIF()
+ 
+     # We need pthreads outside of Windows
+@@ -1249,6 +1258,20 @@ IF(ALSOFT_REQUIRE_SDL2 AND NOT SDL2_FOUND)
+     MESSAGE(FATAL_ERROR "Failed to enabled required SDL2 backend")
+ ENDIF()
+ 
++# Check for VITA backend
++IF(VITA)
++    OPTION(ALSOFT_BACKEND_VITA "Enable VITA backend" ON)
++    IF(ALSOFT_BACKEND_VITA)
++        SET(HAVE_VITA 1)
++        SET(ALC_OBJS  ${ALC_OBJS} Alc/backends/vita.c)
++        SET(BACKENDS  "${BACKENDS} VITA,")
++        add_definitions("-Dmemcpy=sceClibMemcpy")
++        add_definitions("-Dmemset=sceClibMemset")
++        add_definitions("-Dmemmove=sceClibMemmove")
++        add_definitions("-Dmemcmp=sceClibMemcmp")
++    ENDIF()
++ENDIF()
++
+ # Optionally enable the Wave Writer backend
+ OPTION(ALSOFT_BACKEND_WAVE "Enable Wave Writer backend" ON)
+ IF(ALSOFT_BACKEND_WAVE)
+diff --git a/common/threads.h b/common/threads.h
+index b0bebd8d..9e76f33c 100644
+--- a/common/threads.h
++++ b/common/threads.h
+@@ -2,6 +2,9 @@
+ #define AL_THREADS_H
+ 
+ #include <time.h>
++#ifdef __vita__
++#include <psp2/kernel/threadmgr.h>
++#endif
+ 
+ #if defined(__GNUC__) && defined(__i386__)
+ /* force_align_arg_pointer is required for proper function arguments aligning
+@@ -165,6 +168,14 @@ inline void althrd_yield(void)
+ 
+ inline int althrd_sleep(const struct timespec *ts, struct timespec *rem)
+ {
++#ifdef __vita__
++    (void)rem; // unused
++    if(sceKernelDelayThread(ts->tv_sec * 1000000 + ts->tv_nsec / 1000) != 0)
++    {
++        return -2;
++    }
++    return 0;
++#else
+     int ret = nanosleep(ts, rem);
+     if(ret != 0)
+     {
+@@ -172,6 +183,7 @@ inline int althrd_sleep(const struct timespec *ts, struct timespec *rem)
+         errno = 0;
+     }
+     return ret;
++#endif
+ }
+ 
+ 
+diff --git a/config.h.in b/config.h.in
+index 9cc6c16b..9799bf85 100644
+--- a/config.h.in
++++ b/config.h.in
+@@ -83,6 +83,9 @@
+ /* Define if we have the SDL2 backend */
+ #cmakedefine HAVE_SDL2
+ 
++/* Define if we have the PS Vita backend */
++#cmakedefine HAVE_VITA
++
+ /* Define if we have the stat function */
+ #cmakedefine HAVE_STAT
+ 
+diff --git a/native-tools/CMakeLists.txt b/native-tools/CMakeLists.txt
+index 5e816bba..e2db9067 100644
+--- a/native-tools/CMakeLists.txt
++++ b/native-tools/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 3.0.2)
++cmake_minimum_required(VERSION 3.5)
+ 
+ project(native-tools)
+ 

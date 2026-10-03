@@ -1,0 +1,2377 @@
+#include <universal/q_shared.h>
+#include "rb_backend.h"
+#include <qcommon/mem_track.h>
+
+#include "rb_logfile.h"
+#include "rb_stats.h"
+#include "r_image.h"
+#include "rb_state.h"
+#include "rb_shade.h"
+#include "r_cmdbuf.h"
+#include "r_utils.h"
+#include <EffectsCore/fx_system.h>
+#include "r_draw_shadowable_light.h"
+#include "r_state.h"
+#include "r_draw_material.h"
+#include "r_shade.h"
+#include "r_setstate_d3d.h"
+#include <win32/win_local.h>
+#include "rb_pixelcost.h"
+#include "rb_drawprofile.h"
+#include <stringed/stringed_hooks.h>
+#include "rb_draw3d.h"
+#include "r_dvars.h"
+#include "r_pixelcost_load_obj.h"
+#include <win32/win_net.h>
+#include <qcommon/threads.h>
+#include "r_workercmds.h"
+#include "rb_tess.h"
+#include "r_cinematic.h"
+#include "r_model_lighting.h"
+#include "r_draw_bsp.h"
+#include "r_dobj_skin.h"
+#include "r_draw_xmodel.h"
+#include "r_staticmodelcache.h"
+#include "rb_uploadshaders.h"
+#include <universal/timing.h>
+
+#include <setjmp.h>
+#ifdef KISAK_SP
+#include <client/cl_scrn.h>
+#endif
+
+void(__cdecl *const RB_RenderCommandTable[RC_COUNT])(GfxRenderCommandExecState *) =
+{
+  NULL,
+  &RB_SetMaterialColorCmd,
+  &RB_SaveScreenCmd,
+  &RB_SaveScreenSectionCmd,
+  &RB_ClearScreenCmd,
+  &RB_SetViewportCmd,
+  &RB_StretchPicCmd,
+  &RB_StretchPicCmdFlipST,
+  &RB_StretchPicRotateXYCmd,
+  &RB_StretchPicRotateSTCmd,
+  &RB_StretchRawCmd,
+  &RB_DrawQuadPicCmd,
+  &RB_DrawFullScreenColoredQuadCmd,
+  &RB_DrawText2DCmd,
+  &RB_DrawText3DCmd,
+  &RB_BlendSavedScreenBlurredCmd,
+  &RB_BlendSavedScreenFlashedCmd,
+  &RB_DrawPointsCmd,
+  &RB_DrawLinesCmd,
+  &RB_DrawTrianglesCmd,
+  &RB_DrawProfileCmd,
+  &RB_ProjectionSetCmd,
+#ifdef KISAK_RADIANT
+  &RB_BeginViewCmd,                 // RC_BEGIN_VIEW = 0x16 (editor begin-view)
+  &RB_DrawEditorSkinnedCachedCmd,   // RC_DRAW_EDITOR_SKINNEDCACHED = 0x17 (r_ed_scene.cpp)
+  &RB_SetCustomConstantCmd,         // RC_SET_CUSTOM_CONSTANT = 0x18 (#26 layer C2 sun preview)
+#endif
+}; // idb (KISAK_RADIANT extends with RC_BEGIN_VIEW + RC_DRAW_EDITOR_SKINNEDCACHED + RC_SET_CUSTOM_CONSTANT; RC_COUNT sizes the table)
+
+GfxBackEndData *backEndData;
+GfxRenderTarget gfxRenderTargets[17]; // LWSS: changed to 17 to please ASAN. (GfxRenderTargetId)
+
+r_backEndGlobals_t backEnd;
+materialCommands_t tess;
+
+void __cdecl TRACK_rb_backend()
+{
+    track_static_alloc_internal(&backEnd, 640, "backEnd", 18);
+    track_static_alloc_internal(&tess, 2271584, "tess", 18);
+    track_static_alloc_internal(&gfxCmdBufInput, 1072, "gfxCmdBufInput", 18);
+}
+
+bool __cdecl R_GpuFenceTimeout()
+{
+    if (RB_IsGpuFenceFinished())
+        return 1;
+    dx.gpuSyncEnd = __rdtsc();
+    return dx.gpuSyncEnd - dx.gpuSyncStart >= dx.gpuSyncDelay;
+}
+
+void __cdecl R_FinishGpuFence()
+{
+    PROF_SCOPED("R_SyncGpu");
+
+    while (!RB_IsGpuFenceFinished());
+}
+
+void __cdecl R_AcquireGpuFenceLock()
+{
+    Sys_EnterCriticalSection(CRITSECT_GPU_FENCE);
+}
+
+void __cdecl R_ReleaseGpuFenceLock()
+{
+    Sys_LeaveCriticalSection(CRITSECT_GPU_FENCE);
+}
+
+void __cdecl R_InsertGpuFence()
+{
+    const char *v0; // eax
+    int hr; // [esp+0h] [ebp-4h]
+
+	// KISAKGPUFENCE: Comment asserts out for now. Sometimes goes off when alt-tabbing.
+    //if (dx.flushGpuQueryCount)
+    //    MyAssertHandler(".\\rb_backend.cpp", 2602, 0, "%s", "!dx.flushGpuQueryCount");
+    //if (!dx.flushGpuQuery)
+    //    MyAssertHandler(".\\rb_backend.cpp", 2604, 0, "%s", "dx.flushGpuQuery");
+    do
+    {
+        if (r_logFile && r_logFile->current.integer)
+            RB_LogPrint("dx.flushGpuQuery->Issue( (1 << 0) )\n");
+        hr = dx.flushGpuQuery->Issue(1);
+        if (hr < 0)
+        {
+            do
+            {
+                ++g_disableRendering;
+                v0 = R_ErrorDescription(hr);
+                Com_Error(ERR_FATAL, ".\\rb_backend.cpp (%i) dx.flushGpuQuery->Issue( (1 << 0) ) failed: %s\n", 2605, v0);
+            } while (alwaysfails);
+        }
+    } while (alwaysfails);
+    dx.flushGpuQueryIssued = 1;
+    ++dx.flushGpuQueryCount;
+}
+
+void RB_AbandonGpuFence()
+{
+    iassert( dx.flushGpuQuery );
+    iassert( dx.flushGpuQueryIssued );
+    iassert( dx.flushGpuQueryCount == 1 );
+    dx.flushGpuQueryIssued = 0;
+    --dx.flushGpuQueryCount;
+}
+
+void __cdecl RB_CopyBackendStats()
+{
+    rg.stats->c_indexes = g_frameStatsCur.geoIndexCount;
+    rg.stats->c_fxIndexes = g_frameStatsCur.fxIndexCount;
+    rg.stats->c_viewIndexes = RB_Stats_ViewIndexCount(g_frameStatsCur.viewStats);
+    rg.stats->c_shadowIndexes = RB_Stats_ViewIndexCount(&g_frameStatsCur.viewStats[1]);
+    rg.stats->c_vertexes = RB_Stats_TotalVertexCount();
+    rg.stats->c_batches = RB_Stats_TotalPrimCount();
+    R_SumOfUsedImages(&rg.stats->c_imageUsage);
+    rg.stats->dc = 0.0;
+}
+
+void __cdecl RB_SetIdentity()
+{
+    if (gfxCmdBufSourceState.viewMode != VIEW_MODE_IDENTITY)
+    {
+        if (tess.indexCount)
+            RB_EndTessSurface();
+        gfxCmdBufSourceState.viewMode = VIEW_MODE_IDENTITY;
+        memcpy(&gfxCmdBufSourceState.viewParms, &rg, sizeof(gfxCmdBufSourceState.viewParms));
+        gfxCmdBufSourceState.eyeOffset[0] = 0.0;
+        gfxCmdBufSourceState.eyeOffset[1] = 0.0;
+        gfxCmdBufSourceState.eyeOffset[2] = 0.0;
+        gfxCmdBufSourceState.eyeOffset[3] = 1.0;
+        R_CmdBufSet3D(&gfxCmdBufSourceState);
+    }
+}
+
+void __cdecl R_SetVertex2d(GfxVertex *vert, float x, float y, float s, float t, uint32_t color)
+{
+    vert->xyzw[0] = x;
+    vert->xyzw[1] = y;
+    vert->xyzw[2] = 0.0;
+    vert->xyzw[3] = 1.0;
+    vert->normal.packed = 1073643391;
+    vert->color.packed = color;
+    vert->texCoord[0] = s;
+    vert->texCoord[1] = t;
+}
+
+void __cdecl R_SetVertex4dWithNormal(
+    GfxVertex *vert,
+    float x,
+    float y,
+    float z,
+    float w,
+    float nx,
+    float ny,
+    float nz,
+    float s,
+    float t,
+    const uint8_t *color)
+{
+    PackedUnitVec v11; // [esp+28h] [ebp-30h]
+
+    vert->xyzw[0] = x;
+    vert->xyzw[1] = y;
+    vert->xyzw[2] = z;
+    vert->xyzw[3] = w;
+    v11.array[0] = (int)(nx * 127.0 + 127.5);
+    v11.array[1] = (int)(ny * 127.0 + 127.5);
+    v11.array[2] = (int)(nz * 127.0 + 127.5);
+    v11.array[3] = 63;
+    vert->normal = v11;
+    vert->color.packed = *(uint32_t *)color;
+    vert->texCoord[0] = s;
+    vert->texCoord[1] = t;
+}
+
+void __cdecl RB_DrawStretchPic(
+    const Material *material,
+    float x,
+    float y,
+    float w,
+    float h,
+    float s0,
+    float t0,
+    float s1,
+    float t1,
+    uint32_t color,
+    GfxPrimStatsTarget statsTarget)
+{
+    uint16_t vertCount; // [esp+24h] [ebp-4h]
+
+    iassert(gfxCmdBufSourceState.viewMode == VIEW_MODE_2D);
+
+    RB_SetTessTechnique(material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, statsTarget);
+    RB_CheckTessOverflow(4, 6);
+    vertCount = tess.vertexCount;
+    tess.indices[tess.indexCount] = vertCount + 3;
+    tess.indices[tess.indexCount + 1] = vertCount;
+    tess.indices[tess.indexCount + 2] = vertCount + 2;
+    tess.indices[tess.indexCount + 3] = vertCount + 2;
+    tess.indices[tess.indexCount + 4] = vertCount;
+    tess.indices[tess.indexCount + 5] = vertCount + 1;
+    R_SetVertex2d(&tess.verts[tess.vertexCount], x, y, s0, t0, color);
+    R_SetVertex2d(&tess.verts[tess.vertexCount + 1], x + w, y, s1, t0, color);
+    R_SetVertex2d(&tess.verts[tess.vertexCount + 2], x + w, y + h, s1, t1, color);
+    R_SetVertex2d(&tess.verts[tess.vertexCount + 3], x, y + h, s0, t1, color);
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+}
+
+void __cdecl RB_CheckTessOverflow(int vertexCount, int indexCount)
+{
+    if (vertexCount > 5450)
+        MyAssertHandler(
+            "c:\\trees\\cod3\\src\\gfx_d3d\\rb_backend.h",
+            153,
+            0,
+            "%s\n\t(vertexCount) = %i",
+            "(vertexCount <= 5450)",
+            vertexCount);
+    if (indexCount > 0x100000)
+        MyAssertHandler(
+            "c:\\trees\\cod3\\src\\gfx_d3d\\rb_backend.h",
+            154,
+            0,
+            "%s\n\t(indexCount) = %i",
+            "(indexCount <= ((2 * 1024 * 1024) / 2))",
+            indexCount);
+    if (vertexCount + tess.vertexCount > 5450 || indexCount + tess.indexCount > 0x100000)
+        RB_TessOverflow();
+}
+
+void __cdecl RB_DrawStretchPicFlipST(
+    const Material *material,
+    float x,
+    float y,
+    float w,
+    float h,
+    float s0,
+    float t0,
+    float s1,
+    float t1,
+    uint32_t color,
+    GfxPrimStatsTarget statsTarget)
+{
+    float v11; // [esp+1Ch] [ebp-Ch]
+    float v12; // [esp+20h] [ebp-8h]
+    uint16_t vertCount; // [esp+24h] [ebp-4h]
+
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, statsTarget);
+    RB_CheckTessOverflow(4, 6);
+    vertCount = tess.vertexCount;
+    tess.indices[tess.indexCount] = LOWORD(tess.vertexCount) + 3;
+    tess.indices[tess.indexCount + 1] = vertCount;
+    tess.indices[tess.indexCount + 2] = vertCount + 2;
+    tess.indices[tess.indexCount + 3] = vertCount + 2;
+    tess.indices[tess.indexCount + 4] = vertCount;
+    tess.indices[tess.indexCount + 5] = vertCount + 1;
+    R_SetVertex2d(&tess.verts[tess.vertexCount], x, y, s0, t0, color);
+    v12 = x + w;
+    R_SetVertex2d(&tess.verts[tess.vertexCount + 1], v12, y, s0, t1, color);
+    v11 = y + h;
+    R_SetVertex2d(&tess.verts[tess.vertexCount + 2], v12, v11, s1, t1, color);
+    R_SetVertex2d(&tess.verts[tess.vertexCount + 3], x, v11, s1, t0, color);
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+}
+
+void __cdecl RB_DrawFullScreenColoredQuad(
+    const Material *material,
+    float s0,
+    float t0,
+    float s1,
+    float t1,
+    uint32_t color)
+{
+    float screenWidth; // [esp+28h] [ebp-8h]
+    float screenHeight; // [esp+2Ch] [ebp-4h]
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    R_Set2D(&gfxCmdBufSourceState);
+    screenWidth = (float)gfxCmdBufSourceState.renderTargetWidth;
+    screenHeight = (float)gfxCmdBufSourceState.renderTargetHeight;
+    RB_DrawStretchPic(material, 0.0, 0.0, screenWidth, screenHeight, s0, t0, s1, t1, color, GFX_PRIM_STATS_CODE);
+    RB_EndTessSurface();
+}
+
+void __cdecl RB_FullScreenColoredFilter(const Material *material, uint32_t color)
+{
+    RB_DrawFullScreenColoredQuad(material, 0.0, 0.0, 1.0, 1.0, color);
+}
+
+void __cdecl RB_FullScreenFilter(const Material *material)
+{
+    RB_FullScreenColoredFilter(material, 0xFFFFFFFF);
+}
+
+void __cdecl RB_SplitScreenFilter(const Material *material, const GfxViewInfo *viewInfo)
+{
+    float t0; // [esp+28h] [ebp-20h] BYREF
+    float t1; // [esp+2Ch] [ebp-1Ch] BYREF
+    float s1; // [esp+30h] [ebp-18h] BYREF
+    float s0; // [esp+34h] [ebp-14h] BYREF
+    float x; // [esp+38h] [ebp-10h]
+    float y; // [esp+3Ch] [ebp-Ch]
+    float h; // [esp+40h] [ebp-8h]
+    float w; // [esp+44h] [ebp-4h]
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    R_Set2D(&gfxCmdBufSourceState);
+    x = (float)viewInfo->displayViewport.x;
+    y = (float)viewInfo->displayViewport.y;
+    w = (float)viewInfo->displayViewport.width;
+    h = (float)viewInfo->displayViewport.height;
+    RB_SplitScreenTexCoords(x, y, w, h, &s0, &t0, &s1, &t1);
+    RB_DrawStretchPic(material, 0.0, 0.0, w, h, s0, t0, s1, t1, 0xFFFFFFFF, GFX_PRIM_STATS_CODE);
+    RB_EndTessSurface();
+}
+
+void __cdecl RB_SplitScreenTexCoords(float x, float y, float w, float h, float *s0, float *t0, float *s1, float *t1)
+{
+    float screenWidth; // [esp+0h] [ebp-8h]
+    float screenHeight; // [esp+4h] [ebp-4h]
+    float xa; // [esp+10h] [ebp+8h]
+    float ya; // [esp+14h] [ebp+Ch]
+    float wa; // [esp+18h] [ebp+10h]
+    float ha; // [esp+1Ch] [ebp+14h]
+
+    iassert( s0 );
+    iassert( s1 );
+    iassert( t0 );
+    iassert( t1 );
+    screenWidth = (float)gfxCmdBufSourceState.renderTargetWidth;
+    screenHeight = (float)gfxCmdBufSourceState.renderTargetHeight;
+    xa = x / screenWidth;
+    ya = y / screenHeight;
+    wa = w / screenWidth;
+    ha = h / screenHeight;
+    *s0 = xa;
+    *t0 = ya;
+    *s1 = xa + wa;
+    *t1 = ya + ha;
+}
+
+void __cdecl R_Resolve(GfxCmdBufContext context, GfxImage *image)
+{
+    const char *v4; // eax
+    int v6; // [esp+0h] [ebp-Ch]
+    int hr; // [esp+4h] [ebp-8h]
+    IDirect3DSurface9 *imageSurface; // [esp+8h] [ebp-4h]
+
+    iassert( image );
+    iassert(image->width == gfxRenderTargets[context.state->renderTargetId].width);
+    iassert(image->height == gfxRenderTargets[context.state->renderTargetId].height);
+    iassert( image != gfxRenderTargets[context.state->renderTargetId].image );
+
+    imageSurface = Image_GetSurface(image);
+    iassert( imageSurface );
+
+    do
+    {
+        if (r_logFile && r_logFile->current.integer)
+            RB_LogPrint("context.state->prim.device->StretchRect( gfxRenderTargets[context.state->renderTargetId].surface.color, 0, imageSurface, 0, D3DTEXF_LINEAR )\n");
+
+        hr = context.state->prim.device->StretchRect(gfxRenderTargets[context.state->renderTargetId].surface.color, 0, imageSurface, 0, D3DTEXF_LINEAR);
+
+        if (hr < 0)
+        {
+            do
+            {
+                ++g_disableRendering;
+                v4 = R_ErrorDescription(hr);
+                Com_Error(
+                    ERR_FATAL,
+                    ".\\rb_backend.cpp (%i) context.state->prim.device->StretchRect( gfxRenderTargets[context.state->renderTargetId"
+                    "].surface.color, 0, imageSurface, 0, D3DTEXF_LINEAR ) failed: %s\n",
+                    672,
+                    v4);
+            } while (alwaysfails);
+        }
+    } while (alwaysfails);
+    do
+    {
+        if (r_logFile && r_logFile->current.integer)
+            RB_LogPrint("imageSurface->Release()\n");
+        v6 = imageSurface->Release();
+        if (v6 < 0)
+        {
+            do
+            {
+                ++g_disableRendering;
+                Com_Error(ERR_FATAL, ".\\rb_backend.cpp (%i) imageSurface->Release() failed: %s\n", 674, R_ErrorDescription(v6));
+            } while (alwaysfails);
+        }
+    } while (alwaysfails);
+}
+
+void __cdecl RB_StretchPicCmd(GfxRenderCommandExecState *execState)
+{
+    GfxCmdStretchPic *cmd = (GfxCmdStretchPic *)execState->cmd;
+
+    RB_DrawStretchPic(cmd->material, cmd->x, cmd->y, cmd->w, cmd->h, cmd->s0, cmd->t0, cmd->s1, cmd->t1, cmd->color, GFX_PRIM_STATS_HUD);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_StretchPicCmdFlipST(GfxRenderCommandExecState *execState)
+{
+    GfxCmdStretchPic *cmd = (GfxCmdStretchPic *)execState->cmd;
+
+    RB_DrawStretchPicFlipST(cmd->material, cmd->x, cmd->y, cmd->w, cmd->h, cmd->s0, cmd->t0, cmd->s1, cmd->t1, cmd->color, GFX_PRIM_STATS_HUD);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_StretchPicRotateXYCmd(GfxRenderCommandExecState *execState)
+{
+    float v1; // [esp+14h] [ebp-64h]
+    float v2; // [esp+18h] [ebp-60h]
+    float v3; // [esp+1Ch] [ebp-5Ch]
+    float v4; // [esp+20h] [ebp-58h]
+    float v5; // [esp+24h] [ebp-54h]
+    float v6; // [esp+28h] [ebp-50h]
+    float x; // [esp+2Ch] [ebp-4Ch]
+    float y; // [esp+30h] [ebp-48h]
+    float v9; // [esp+40h] [ebp-38h]
+    float halfWidth; // [esp+44h] [ebp-34h]
+    float stepY; // [esp+48h] [ebp-30h]
+    float stepY_4; // [esp+4Ch] [ebp-2Ch]
+    float cosAngle; // [esp+50h] [ebp-28h]
+    float stepX; // [esp+54h] [ebp-24h]
+    float stepX_4; // [esp+58h] [ebp-20h]
+    int indexCount; // [esp+5Ch] [ebp-1Ch]
+    float midX; // [esp+60h] [ebp-18h]
+    float sinAngle; // [esp+64h] [ebp-14h]
+    uint16_t vertCount; // [esp+68h] [ebp-10h]
+    float midY; // [esp+6Ch] [ebp-Ch]
+    const GfxCmdStretchPicRotateXY *cmd; // [esp+70h] [ebp-8h]
+    float halfHeight; // [esp+74h] [ebp-4h]
+
+    cmd = (const GfxCmdStretchPicRotateXY *)execState->cmd;
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(cmd->material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_HUD);
+    RB_CheckTessOverflow(4, 6);
+    vertCount = tess.vertexCount;
+    indexCount = tess.indexCount;
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+    tess.indices[indexCount] = vertCount + 3;
+    tess.indices[indexCount + 1] = vertCount;
+    tess.indices[indexCount + 2] = vertCount + 2;
+    tess.indices[indexCount + 3] = vertCount + 2;
+    tess.indices[indexCount + 4] = vertCount;
+    tess.indices[indexCount + 5] = vertCount + 1;
+    halfWidth = cmd->w * 0.5;
+    halfHeight = cmd->h * 0.5;
+    midX = cmd->x + halfWidth;
+    midY = cmd->y + halfHeight;
+    v9 = DEG2RAD( cmd->rotation );
+    cosAngle = cos(v9);
+    sinAngle = sin(v9);
+    stepX = halfWidth * cosAngle;
+    stepX_4 = halfWidth * sinAngle;
+    stepY = -halfHeight * sinAngle;
+    stepY_4 = halfHeight * cosAngle;
+    y = midY - stepX_4 - stepY_4;
+    x = midX - stepX - stepY;
+    R_SetVertex2d(&tess.verts[vertCount], x, y, cmd->s0, cmd->t0, cmd->color.packed);
+    v6 = midY + stepX_4 - stepY_4;
+    v5 = midX + stepX - stepY;
+    R_SetVertex2d(&tess.verts[vertCount + 1], v5, v6, cmd->s1, cmd->t0, cmd->color.packed);
+    v4 = midY + stepX_4 + stepY_4;
+    v3 = midX + stepX + stepY;
+    R_SetVertex2d(&tess.verts[vertCount + 2], v3, v4, cmd->s1, cmd->t1, cmd->color.packed);
+    v2 = midY - stepX_4 + stepY_4;
+    v1 = midX - stepX + stepY;
+    R_SetVertex2d(&tess.verts[vertCount + 3], v1, v2, cmd->s0, cmd->t1, cmd->color.packed);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_StretchPicRotateSTCmd(GfxRenderCommandExecState *execState)
+{
+    float v1; // [esp+14h] [ebp-64h]
+    float v2; // [esp+18h] [ebp-60h]
+    float y; // [esp+1Ch] [ebp-5Ch]
+    float x; // [esp+20h] [ebp-58h]
+    float v5; // [esp+30h] [ebp-48h]
+    float cosAngle; // [esp+34h] [ebp-44h]
+    int indexCount; // [esp+38h] [ebp-40h]
+    float sinAngle; // [esp+3Ch] [ebp-3Ch]
+    float texS; // [esp+40h] [ebp-38h]
+    float texS_4; // [esp+44h] [ebp-34h]
+    float texS_8; // [esp+48h] [ebp-30h]
+    float texS_12; // [esp+4Ch] [ebp-2Ch]
+    uint16_t vertCount; // [esp+50h] [ebp-28h]
+    float stepT; // [esp+54h] [ebp-24h]
+    float stepT_4; // [esp+58h] [ebp-20h]
+    const GfxCmdStretchPicRotateST *cmd; // [esp+5Ch] [ebp-1Ch]
+    float stepS; // [esp+60h] [ebp-18h]
+    float stepS_4; // [esp+64h] [ebp-14h]
+    float texT; // [esp+68h] [ebp-10h]
+    float texT_4; // [esp+6Ch] [ebp-Ch]
+    float texT_8; // [esp+70h] [ebp-8h]
+    float texT_12; // [esp+74h] [ebp-4h]
+
+    cmd = (const GfxCmdStretchPicRotateST *)execState->cmd;
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(cmd->material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_HUD);
+    vertCount = tess.vertexCount;
+    indexCount = tess.indexCount;
+    RB_CheckTessOverflow(4, 6);
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+    tess.indices[indexCount] = vertCount + 3;
+    tess.indices[indexCount + 1] = vertCount;
+    tess.indices[indexCount + 2] = vertCount + 2;
+    tess.indices[indexCount + 3] = vertCount + 2;
+    tess.indices[indexCount + 4] = vertCount;
+    tess.indices[indexCount + 5] = vertCount + 1;
+    v5 = DEG2RAD( cmd->rotation );
+    cosAngle = cos(v5);
+    sinAngle = sin(v5);
+    stepS = cmd->radiusST * cosAngle * cmd->scaleFinalS;
+    stepS_4 = cmd->radiusST * sinAngle * cmd->scaleFinalT;
+    stepT = -cmd->radiusST * sinAngle * cmd->scaleFinalS;
+    stepT_4 = cmd->radiusST * cosAngle * cmd->scaleFinalT;
+    texS = cmd->centerS - stepS - stepT;
+    texT = cmd->centerT - stepS_4 - stepT_4;
+    texS_4 = cmd->centerS + stepS - stepT;
+    texT_4 = cmd->centerT + stepS_4 - stepT_4;
+    texS_8 = cmd->centerS + stepS + stepT;
+    texT_8 = cmd->centerT + stepS_4 + stepT_4;
+    texS_12 = cmd->centerS - stepS + stepT;
+    texT_12 = cmd->centerT - stepS_4 + stepT_4;
+    R_SetVertex2d(&tess.verts[vertCount], cmd->x, cmd->y, texS, texT, cmd->color.packed);
+    x = cmd->x + cmd->w;
+    R_SetVertex2d(&tess.verts[vertCount + 1], x, cmd->y, texS_4, texT_4, cmd->color.packed);
+    y = cmd->y + cmd->h;
+    v2 = cmd->x + cmd->w;
+    R_SetVertex2d(&tess.verts[vertCount + 2], v2, y, texS_8, texT_8, cmd->color.packed);
+    v1 = cmd->y + cmd->h;
+    R_SetVertex2d(&tess.verts[vertCount + 3], cmd->x, v1, texS_12, texT_12, cmd->color.packed);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawQuadPicCmd(GfxRenderCommandExecState *execState)
+{
+    int indexCount; // [esp+18h] [ebp-Ch]
+    uint16_t vertCount; // [esp+1Ch] [ebp-8h]
+    const GfxCmdDrawQuadPic *cmd; // [esp+20h] [ebp-4h]
+
+    cmd = (const GfxCmdDrawQuadPic *)execState->cmd;
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(cmd->material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_HUD);
+    RB_CheckTessOverflow(4, 6);
+    vertCount = tess.vertexCount;
+    indexCount = tess.indexCount;
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+    tess.indices[indexCount] = vertCount + 3;
+    tess.indices[indexCount + 1] = vertCount;
+    tess.indices[indexCount + 2] = vertCount + 2;
+    tess.indices[indexCount + 3] = vertCount + 2;
+    tess.indices[indexCount + 4] = vertCount;
+    tess.indices[indexCount + 5] = vertCount + 1;
+    R_SetVertex2d(&tess.verts[vertCount], cmd->verts[0][0], cmd->verts[0][1], 0.0, 0.0, cmd->color.packed);
+    R_SetVertex2d(&tess.verts[vertCount + 1], cmd->verts[1][0], cmd->verts[1][1], 1.0, 0.0, cmd->color.packed);
+    R_SetVertex2d(&tess.verts[vertCount + 2], cmd->verts[2][0], cmd->verts[2][1], 1.0, 1.0, cmd->color.packed);
+    R_SetVertex2d(&tess.verts[vertCount + 3], cmd->verts[3][0], cmd->verts[3][1], 0.0, 1.0, cmd->color.packed);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawFullScreenColoredQuadCmd(GfxRenderCommandExecState *execState)
+{
+    GfxCmdDrawFullScreenColoredQuad *cmd = (GfxCmdDrawFullScreenColoredQuad *)execState->cmd;
+
+    RB_DrawFullScreenColoredQuad(cmd->material, cmd->s0, cmd->t0, cmd->s1, cmd->t1, cmd->color);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_StretchRawCmd(GfxRenderCommandExecState *execState)
+{
+    GfxCmdStretchRaw *cmd = (GfxCmdStretchRaw *)execState->cmd;
+
+    RB_StretchRaw(cmd->x, cmd->y, cmd->w, cmd->h, cmd->cols, cmd->rows, cmd->data);
+    execState->cmd = (char*)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_StretchRaw(int x, int y, int w, int h, int cols, int rows, const uint8_t *data)
+{
+    const char *v7; // eax
+    int v8; // [esp+8h] [ebp-34h]
+    _D3DLOCKED_RECT lockedRect; // [esp+10h] [ebp-2Ch] BYREF
+    IDirect3DSurface9 *rawSurf; // [esp+18h] [ebp-24h] BYREF
+    uint8_t *dest; // [esp+1Ch] [ebp-20h]
+    tagRECT dstRect; // [esp+20h] [ebp-1Ch] BYREF
+    int colIndex; // [esp+30h] [ebp-Ch]
+    int newline; // [esp+34h] [ebp-8h]
+    int rowIndex; // [esp+38h] [ebp-4h]
+
+    if (dx.device->CreateOffscreenPlainSurface(cols, rows, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &rawSurf, 0) >= 0)
+    {
+        do
+        {
+            if (r_logFile && r_logFile->current.integer)
+                RB_LogPrint("rawSurf->LockRect( &lockedRect, 0, 0x00002000L )\n");
+            v8 = rawSurf->LockRect(&lockedRect, 0, 0x2000u);
+            if (v8 < 0)
+            {
+                do
+                {
+                    ++g_disableRendering;
+                    v7 = R_ErrorDescription(v8);
+                    Com_Error(
+                        ERR_FATAL,
+                        ".\\rb_backend.cpp (%i) rawSurf->LockRect( &lockedRect, 0, 0x00002000L ) failed: %s\n",
+                        939,
+                        v7);
+                } while (alwaysfails);
+            }
+        } while (alwaysfails);
+        dest = (uint8_t *)lockedRect.pBits;
+        newline = lockedRect.Pitch - 4 * cols;
+        for (rowIndex = 0; rowIndex < rows; ++rowIndex)
+        {
+            for (colIndex = 0; colIndex < cols; ++colIndex)
+            {
+                Byte4CopyRgbaToVertexColor(data, dest);
+                data += 4;
+                dest += 4;
+            }
+            dest += newline;
+        }
+        rawSurf->UnlockRect();
+        dstRect.left = x;
+        dstRect.top = y;
+        dstRect.right = w + x;
+        dstRect.bottom = h + y;
+        //((void(__thiscall *)(IDirect3DDevice9 *, IDirect3DDevice9 *, IDirect3DSurface9 *, _DWORD, IDirect3DSurface9 *, tagRECT *, int))dx.device->StretchRect)(
+        //    dx.device,
+        //    dx.device,
+        //    rawSurf,
+        //    0,
+        //    gfxRenderTargets[1].surface.color,
+        //    &dstRect,
+        //    2);
+        dx.device->StretchRect(rawSurf, 0, gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color, &dstRect, D3DTEXF_LINEAR);
+
+        rawSurf->Release();
+    }
+}
+
+void __cdecl R_DrawSurfs(GfxCmdBufContext context, GfxCmdBufState *prepassState, const GfxDrawSurfListInfo *info)
+{
+    GfxViewport viewport; // [esp+30h] [ebp-30h] BYREF
+    GfxCmdBufContext prepassContext; // [esp+40h] [ebp-20h]
+    GfxDrawSurfListArgs listArgs; // [esp+48h] [ebp-18h] BYREF
+    uint32_t processedDrawSurfCount; // [esp+58h] [ebp-8h]
+    uint32_t drawSurfCount; // [esp+5Ch] [ebp-4h]
+
+    PROF_SCOPED("R_DrawSurfs");
+
+    iassert(context.source->cameraView == info->cameraView);
+    context.state->origMaterial = 0;
+    R_SetDrawSurfsShadowableLight(context.source, info);
+    R_Set3D(context.source);
+    if (context.source->viewportIsDirty)
+    {
+        R_GetViewport(context.source, &viewport);
+        R_SetViewport(context.state, &viewport);
+        if (prepassState)
+            R_SetViewport(prepassState, &viewport);
+        R_UpdateViewport(context.source, &viewport);
+    }
+    prepassContext.source = prepassState != 0 ? context.source : 0;
+    prepassContext.state = prepassState;
+    iassert(dx.d3d9 && dx.device);
+    drawSurfCount = info->drawSurfCount;
+    listArgs.context = context;
+    listArgs.firstDrawSurfIndex = 0;
+    listArgs.info = info;
+    while (listArgs.firstDrawSurfIndex != drawSurfCount)
+    {
+        processedDrawSurfCount = R_RenderDrawSurfListMaterial(&listArgs, prepassContext);
+        listArgs.firstDrawSurfIndex += processedDrawSurfCount;
+    }
+    g_viewStats->drawSurfCount += info->drawSurfCount;
+    R_TessEnd(context, prepassContext);
+    context.state->origMaterial = 0;
+}
+
+
+uint32_t(__cdecl *const rb_tessTable[13])(const GfxDrawSurfListArgs *, GfxCmdBufContext) =
+{
+  &R_TessTrianglesList,
+  &R_TessTrianglesPreTessList,
+  &R_TessStaticModelRigidDrawSurfList,
+  &R_TessStaticModelPreTessList,
+  &R_TessStaticModelCachedList,
+  &R_TessStaticModelSkinnedDrawSurfList,
+  &R_TessBModel,
+  &R_TessXModelRigidDrawSurfList,
+  &R_TessXModelRigidSkinnedDrawSurfList,
+  &R_TessXModelSkinnedDrawSurfList,
+  &R_TessCodeMeshList,
+  &R_TessMarkMeshList,
+  &R_TessParticleCloudList
+}; // idb
+
+uint32_t __cdecl R_RenderDrawSurfListMaterial(const GfxDrawSurfListArgs *listArgs, GfxCmdBufContext prepassContext)
+{
+    //GfxCmdBufSourceState *passPrepassContext; // [esp+4h] [ebp-28h]
+    //GfxCmdBufState *passPrepassContext_4; // [esp+8h] [ebp-24h]
+    GfxCmdBufContext passPrepassContext;
+    GfxDrawSurf drawSurf; // [esp+Ch] [ebp-20h]
+    uint32_t subListCount; // [esp+18h] [ebp-14h]
+    const GfxDrawSurf *drawSurfList; // [esp+1Ch] [ebp-10h]
+    uint32_t passIndex; // [esp+20h] [ebp-Ch]
+    bool isPixelCostEnabled; // [esp+27h] [ebp-5h]
+    uint32_t drawSurfCount; // [esp+28h] [ebp-4h]
+
+    drawSurfCount = listArgs->info->drawSurfCount - listArgs->firstDrawSurfIndex;
+    drawSurfList = &listArgs->info->drawSurfs[listArgs->firstDrawSurfIndex];
+    drawSurf.packed = drawSurfList->packed;
+    if (!R_SetupMaterial(listArgs->context, &prepassContext, listArgs->info, drawSurf))
+        return R_SkipDrawSurfListMaterial(drawSurfList, drawSurfCount);
+    isPixelCostEnabled = pixelCostMode != GFX_PIXEL_COST_MODE_OFF;
+    if (pixelCostMode)
+        R_PixelCost_BeginSurface(listArgs->context);
+    if (prepassContext.state && prepassContext.state->technique->passCount != 1)
+        MyAssertHandler(
+            ".\\rb_backend.cpp",
+            1013,
+            0,
+            "%s",
+            "!prepassContext.state || (prepassContext.state->technique->passCount == 1)");
+    passPrepassContext.source = prepassContext.source;
+    subListCount = 0;
+    for (passIndex = 0; passIndex < listArgs->context.state->technique->passCount; ++passIndex)
+    {
+        R_UpdateMaterialTime(listArgs->context.source, 0.0);
+        R_SetupPass(listArgs->context, passIndex);
+        if (passIndex || !prepassContext.state)
+        {
+            passPrepassContext.state = 0;
+        }
+        else
+        {
+            R_SetupPass(prepassContext, 0);
+            passPrepassContext.state = prepassContext.state;
+        }
+        iassert(drawSurf.fields.surfType < ARRAY_COUNT(rb_tessTable));
+        subListCount = rb_tessTable[drawSurf.fields.surfType](listArgs, passPrepassContext);
+    }
+    if (isPixelCostEnabled)
+        R_PixelCost_EndSurface(listArgs->context);
+    if (!subListCount || subListCount > drawSurfCount)
+        MyAssertHandler(
+            ".\\rb_backend.cpp",
+            1049,
+            0,
+            "subListCount not in [1, drawSurfCount]\n\t%i not in [%i, %i]",
+            subListCount,
+            1,
+            drawSurfCount);
+    return subListCount;
+}
+
+void __cdecl R_TessEnd(GfxCmdBufContext context, GfxCmdBufContext prepassContext)
+{
+    GfxDepthRangeType v2; // [esp+0h] [ebp-Ch]
+    GfxDepthRangeType depthRangeType; // [esp+4h] [ebp-8h]
+
+    if (prepassContext.state && context.source != prepassContext.source)
+        MyAssertHandler(
+            ".\\rb_backend.cpp",
+            1059,
+            0,
+            "%s",
+            "prepassContext.state == NULL || commonSource == prepassContext.source");
+    context.source->objectPlacement = 0;
+    R_ChangeDepthHackNearClip(context.source, 0);
+    depthRangeType = (GfxDepthRangeType)((context.source->cameraView != 0) - 1);
+    if (depthRangeType != context.state->depthRangeType)
+        R_ChangeDepthRange(context.state, depthRangeType);
+    if (prepassContext.state)
+    {
+        v2 = (GfxDepthRangeType)((prepassContext.source->cameraView != 0) - 1);
+        if (v2 != prepassContext.state->depthRangeType)
+            R_ChangeDepthRange(prepassContext.state, v2);
+    }
+}
+
+void __cdecl RB_ClearScreenCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdClearScreen *cmd = (const GfxCmdClearScreen *)execState->cmd;
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+
+    R_ClearScreen(
+        gfxCmdBufState.prim.device,
+        cmd->whichToClear,
+        cmd->color,
+        cmd->depth,
+        cmd->stencil,
+        0);
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_SetGammaRamp(const GfxGammaRamp *gammaTable)
+{
+    int colorIndex; // [esp+0h] [ebp-60Ch]
+    _D3DGAMMARAMP d3dGammaRamp; // [esp+4h] [ebp-608h] BYREF
+
+    iassert( gammaTable != NULL );
+    iassert( vidConfig.deviceSupportsGamma == true );
+    iassert( dx.device != NULL );
+    for (colorIndex = 0; colorIndex < 256; ++colorIndex)
+    {
+        d3dGammaRamp.red[colorIndex] = gammaTable->entries[colorIndex];
+        d3dGammaRamp.green[colorIndex] = gammaTable->entries[colorIndex];
+        d3dGammaRamp.blue[colorIndex] = gammaTable->entries[colorIndex];
+    }
+    dx.device->SetGammaRamp(dx.targetWindowIndex, 0, &d3dGammaRamp);
+}
+
+void __cdecl RB_SaveScreenCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdSaveScreen *cmd; // [esp+4h] [ebp-4h]
+
+    cmd = (const GfxCmdSaveScreen *)execState->cmd;
+
+    bcassert(cmd->screenTimerId, ARRAY_COUNT(rgp.savedScreenTimes));
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    R_Resolve(gfxCmdBufContext, gfxRenderTargets[R_RENDERTARGET_SAVED_SCREEN].image);
+    rgp.savedScreenTimes[cmd->screenTimerId] = gfxCmdBufSourceState.sceneDef.time;
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_SaveScreenSectionCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdSaveScreenSection *cmd; // [esp+14h] [ebp-4h]
+
+    cmd = (const GfxCmdSaveScreenSection *)execState->cmd;
+
+    bcassert(cmd->screenTimerId, ARRAY_COUNT(rgp.savedScreenTimes));
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+
+    R_ResolveSection(gfxCmdBufContext, gfxRenderTargets[R_RENDERTARGET_SAVED_SCREEN].image);
+    rgp.savedScreenTimes[cmd->screenTimerId] = gfxCmdBufSourceState.sceneDef.time;
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl R_ResolveSection(GfxCmdBufContext context, GfxImage *image)
+{
+    iassert(image);
+    if (!alwaysfails)
+        MyAssertHandler(".\\rb_backend.cpp", 706, 0, "R_ResolveSection(): Not implemented on win32.");
+}
+
+void __cdecl RB_BlendSavedScreenBlurredCmd(GfxRenderCommandExecState *execState)
+{
+    float s1; // [esp+28h] [ebp-48h]
+    float t1; // [esp+2Ch] [ebp-44h]
+    float v3; // [esp+30h] [ebp-40h]
+    float v5; // [esp+54h] [ebp-1Ch]
+    float screenWidth; // [esp+58h] [ebp-18h]
+    int frameTime; // [esp+5Ch] [ebp-14h]
+    float screenHeight; // [esp+64h] [ebp-Ch]
+    const GfxCmdBlendSavedScreenBlurred *cmd; // [esp+68h] [ebp-8h]
+    float alpha; // [esp+6Ch] [ebp-4h]
+
+    cmd = (const GfxCmdBlendSavedScreenBlurred *)execState->cmd;
+    iassert( cmd->fadeMsec > 0 );
+    if (cmd->screenTimerId >= 4u)
+        MyAssertHandler(
+            ".\\rb_backend.cpp",
+            1280,
+            0,
+            "cmd->screenTimerId doesn't index ARRAY_COUNT( rgp.savedScreenTimes )\n\t%i not in [0, %i)",
+            cmd->screenTimerId,
+            4);
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    frameTime = gfxCmdBufSourceState.sceneDef.time - rgp.savedScreenTimes[cmd->screenTimerId];
+    if (frameTime >= 0 && frameTime < cmd->fadeMsec)
+    {
+        v5 = (double)frameTime / (double)cmd->fadeMsec;
+        v3 = pow(0.0099999998, v5);
+        alpha = v3;
+        if (v3 > 0.99f)
+            alpha = 0.99f;
+        screenWidth = (double)gfxCmdBufSourceState.renderTargetWidth * cmd->ds;
+        screenHeight = (double)gfxCmdBufSourceState.renderTargetHeight * cmd->dt;
+        R_SetCodeImageTexture(&gfxCmdBufSourceState, TEXTURE_SRC_CODE_FEEDBACK, gfxRenderTargets[R_RENDERTARGET_SAVED_SCREEN].image);
+        t1 = cmd->t0 + cmd->dt;
+        s1 = cmd->s0 + cmd->ds;
+        RB_DrawStretchPic(
+            rgp.shellShockBlurredMaterial,
+            0.0,
+            0.0,
+            screenWidth,
+            screenHeight,
+            cmd->s0,
+            cmd->t0,
+            s1,
+            t1,
+            ((uint8_t)SnapFloatToInt(alpha * 255.0f) << 24) | 0xFFFFFF,
+            GFX_PRIM_STATS_CODE);
+    }
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl R_SetCodeImageTexture(GfxCmdBufSourceState *source, MaterialTextureSource codeTexture, const GfxImage *image)
+{
+    iassert(source);
+    iassert(codeTexture < TEXTURE_SRC_CODE_COUNT);
+
+    source->input.codeImages[codeTexture] = image;
+}
+
+void __cdecl RB_BlendSavedScreenFlashedCmd(GfxRenderCommandExecState *execState)
+{
+    float s1; // [esp+28h] [ebp-50h]
+    float t1; // [esp+2Ch] [ebp-4Ch]
+    float screenWidth; // [esp+64h] [ebp-14h]
+    float screenHeight; // [esp+70h] [ebp-8h]
+    const GfxCmdBlendSavedScreenFlashed *cmd; // [esp+74h] [ebp-4h]
+
+    cmd = (const GfxCmdBlendSavedScreenFlashed *)execState->cmd;
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    screenWidth = (double)gfxCmdBufSourceState.renderTargetWidth * cmd->ds;
+    screenHeight = (double)gfxCmdBufSourceState.renderTargetHeight * cmd->dt;
+    R_SetCodeImageTexture(&gfxCmdBufSourceState, TEXTURE_SRC_CODE_FEEDBACK, gfxRenderTargets[R_RENDERTARGET_SAVED_SCREEN].image);
+    t1 = cmd->t0 + cmd->dt;
+    s1 = cmd->s0 + cmd->ds;
+    RB_DrawStretchPic(
+        rgp.shellShockFlashedMaterial,
+        0.0,
+        0.0,
+        screenWidth,
+        screenHeight,
+        cmd->s0,
+        cmd->t0,
+        s1,
+        t1,
+        ((uint8_t)SnapFloatToInt(cmd->intensityScreengrab * 255.0f) << 24)
+        | (uint8_t)SnapFloatToInt(cmd->intensityWhiteout * 255.0f)
+        | ((uint8_t)SnapFloatToInt(cmd->intensityWhiteout * 255.0f) << 8)
+        | ((uint8_t)SnapFloatToInt(cmd->intensityWhiteout * 255.0f) << 16),
+        GFX_PRIM_STATS_CODE);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawPointsCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdDrawPoints *cmd; // [esp+4h] [ebp-4h]
+
+    cmd = (const GfxCmdDrawPoints *)execState->cmd;
+
+    if (cmd->dimensions == 2)
+    {
+        RB_DrawPoints2D(cmd);
+    }
+    else
+    {
+        iassert(cmd->dimensions == 3);
+        RB_DrawPoints3D(cmd);
+    }
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawPoints2D(const GfxCmdDrawPoints *cmd)
+{
+    float v1; // [esp+1Ch] [ebp-30h]
+    float v2; // [esp+20h] [ebp-2Ch]
+    float v3; // [esp+24h] [ebp-28h]
+    float v4; // [esp+28h] [ebp-24h]
+    float v5; // [esp+2Ch] [ebp-20h]
+    float v6; // [esp+30h] [ebp-1Ch]
+    float x; // [esp+34h] [ebp-18h]
+    float y; // [esp+38h] [ebp-14h]
+    float size; // [esp+40h] [ebp-Ch]
+    int pointIndex; // [esp+44h] [ebp-8h]
+    const GfxPointVertex *v; // [esp+48h] [ebp-4h]
+
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(rgp.whiteMaterial, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_DEBUG);
+    size = (double)cmd->size * 0.5;
+    pointIndex = 0;
+    v = cmd->verts;
+    while (pointIndex < cmd->pointCount)
+    {
+        RB_CheckTessOverflow(4, 6);
+        tess.indices[tess.indexCount] = LOWORD(tess.vertexCount) + 1;
+        tess.indices[tess.indexCount + 1] = tess.vertexCount;
+        tess.indices[tess.indexCount + 2] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 3] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 4] = tess.vertexCount;
+        tess.indices[tess.indexCount + 5] = LOWORD(tess.vertexCount) + 3;
+        tess.indexCount += 6;
+        y = v->xyz[1] - size;
+        x = v->xyz[0] - size;
+        R_SetVertex4d(&tess.verts[tess.vertexCount], x, y, v->xyz[2], 1.0, 0.0, 0.0, v->color);
+        v6 = v->xyz[1] + size;
+        v5 = v->xyz[0] - size;
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 1], v5, v6, v->xyz[2], 1.0, 0.0, 1.0, v->color);
+        v4 = v->xyz[1] + size;
+        v3 = v->xyz[0] + size;
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 2], v3, v4, v->xyz[2], 1.0, 1.0, 1.0, v->color);
+        v2 = v->xyz[1] - size;
+        v1 = v->xyz[0] + size;
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 3], v1, v2, v->xyz[2], 1.0, 1.0, 0.0, v->color);
+        tess.vertexCount += 4;
+        ++pointIndex;
+        ++v;
+    }
+}
+
+void __cdecl R_SetVertex4d(
+    GfxVertex *vert,
+    float x,
+    float y,
+    float z,
+    float w,
+    float s,
+    float t,
+    const uint8_t *color)
+{
+    vert->xyzw[0] = x;
+    vert->xyzw[1] = y;
+    vert->xyzw[2] = z;
+    vert->xyzw[3] = w;
+    vert->normal.packed = 1073643391;
+    vert->color.packed = *(uint32_t *)color;
+    vert->texCoord[0] = s;
+    vert->texCoord[1] = t;
+}
+
+void __cdecl RB_DrawPoints3D(const GfxCmdDrawPoints *cmd)
+{
+    float v1; // [esp+24h] [ebp-4Ch]
+    float v2; // [esp+30h] [ebp-40h]
+    float x; // [esp+34h] [ebp-3Ch]
+    float y; // [esp+38h] [ebp-38h]
+    const float *transform; // [esp+44h] [ebp-2Ch]
+    float xyz; // [esp+48h] [ebp-28h]
+    float xyz_4; // [esp+4Ch] [ebp-24h]
+    float xyz_8; // [esp+50h] [ebp-20h]
+    float xyz_8a; // [esp+50h] [ebp-20h]
+    float xyz_12; // [esp+54h] [ebp-1Ch]
+    float invWidth; // [esp+58h] [ebp-18h]
+    float invHeight; // [esp+5Ch] [ebp-14h]
+    float offset; // [esp+60h] [ebp-10h]
+    float offset_4; // [esp+64h] [ebp-Ch]
+    int pointIndex; // [esp+68h] [ebp-8h]
+    const GfxPointVertex *v; // [esp+6Ch] [ebp-4h]
+
+    RB_SetTessTechnique(rgp.pointMaterial, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_DEBUG);
+    RB_SetIdentity();
+    transform = (const float *)&gfxCmdBufSourceState.viewParms3D->viewProjectionMatrix;
+    invWidth = (double)cmd->size * 1.0 / (double)gfxCmdBufSourceState.renderTargetWidth;
+    invHeight = (double)cmd->size * 1.0 / (double)gfxCmdBufSourceState.renderTargetHeight;
+    pointIndex = 0;
+    v = cmd->verts;
+    while (pointIndex < cmd->pointCount)
+    {
+        xyz = v->xyz[0] * *transform + v->xyz[1] * transform[4] + v->xyz[2] * transform[8] + transform[12];
+        xyz_4 = v->xyz[0] * transform[1] + v->xyz[1] * transform[5] + v->xyz[2] * transform[9] + transform[13];
+        xyz_8 = v->xyz[0] * transform[2] + v->xyz[1] * transform[6] + v->xyz[2] * transform[10] + transform[14];
+        xyz_12 = v->xyz[0] * transform[3] + v->xyz[1] * transform[7] + v->xyz[2] * transform[11] + transform[15];
+        offset = invWidth * xyz_12;
+        offset_4 = invHeight * xyz_12;
+        xyz_8a = xyz_8 - xyz_12 * EQUAL_EPSILON;
+        RB_CheckTessOverflow(4, 6);
+        tess.indices[tess.indexCount] = LOWORD(tess.vertexCount) + 3;
+        tess.indices[tess.indexCount + 1] = tess.vertexCount;
+        tess.indices[tess.indexCount + 2] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 3] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 4] = tess.vertexCount;
+        tess.indices[tess.indexCount + 5] = LOWORD(tess.vertexCount) + 1;
+        tess.indexCount += 6;
+        y = xyz_4 - offset_4;
+        x = xyz - offset;
+        R_SetVertex4d(&tess.verts[tess.vertexCount], x, y, xyz_8a, xyz_12, 0.0, 0.0, v->color);
+        v2 = xyz_4 + offset_4;
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 1], x, v2, xyz_8a, xyz_12, 0.0, 1.0, v->color);
+        v1 = xyz + offset;
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 2], v1, v2, xyz_8a, xyz_12, 1.0, 1.0, v->color);
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 3], v1, y, xyz_8a, xyz_12, 1.0, 0.0, v->color);
+        tess.vertexCount += 4;
+        ++pointIndex;
+        ++v;
+    }
+    RB_EndTessSurface();
+}
+
+void __cdecl RB_DrawLines2D(int count, int width, const GfxPointVertex *verts)
+{
+    float v3; // [esp+18h] [ebp-34h]
+    float v4; // [esp+1Ch] [ebp-30h]
+    float v5; // [esp+20h] [ebp-2Ch]
+    float v6; // [esp+24h] [ebp-28h]
+    float v7; // [esp+28h] [ebp-24h]
+    float v8; // [esp+2Ch] [ebp-20h]
+    float x; // [esp+30h] [ebp-1Ch]
+    float y; // [esp+34h] [ebp-18h]
+    float delta[2]; // [esp+38h] [ebp-14h] BYREF
+    int lineIndex; // [esp+40h] [ebp-Ch]
+    const GfxPointVertex *v[2]; // [esp+44h] [ebp-8h]
+
+    iassert( (count > 0) );
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(rgp.whiteMaterial, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_DEBUG);
+    for (lineIndex = 0; lineIndex < count; ++lineIndex)
+    {
+        v[0] = &verts[2 * lineIndex];
+        v[1] = &verts[2 * lineIndex + 1];
+        delta[0] = v[1]->xyz[1] - v[0]->xyz[1];
+        delta[1] = v[0]->xyz[0] - v[1]->xyz[0];
+        Vec2Normalize(delta);
+        delta[0] = delta[0] * 0.5;
+        delta[1] = delta[1] * 0.5;
+        RB_CheckTessOverflow(4, 6);
+        tess.indices[tess.indexCount] = LOWORD(tess.vertexCount) + 1;
+        tess.indices[tess.indexCount + 1] = tess.vertexCount;
+        tess.indices[tess.indexCount + 2] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 3] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 4] = tess.vertexCount;
+        tess.indices[tess.indexCount + 5] = LOWORD(tess.vertexCount) + 3;
+        tess.indexCount += 6;
+        y = v[0]->xyz[1] - delta[1];
+        x = v[0]->xyz[0] - delta[0];
+        R_SetVertex3d(&tess.verts[tess.vertexCount], x, y, v[0]->xyz[2], 0.0, 0.0, v[0]->color);
+        v8 = v[1]->xyz[1] - delta[1];
+        v7 = v[1]->xyz[0] - delta[0];
+        R_SetVertex3d(&tess.verts[tess.vertexCount + 1], v7, v8, v[1]->xyz[2], 0.0, 1.0, v[1]->color);
+        v6 = v[1]->xyz[1] + delta[1];
+        v5 = v[1]->xyz[0] + delta[0];
+        R_SetVertex3d(&tess.verts[tess.vertexCount + 2], v5, v6, v[1]->xyz[2], 1.0, 1.0, v[1]->color);
+        v4 = v[0]->xyz[1] + delta[1];
+        v3 = v[0]->xyz[0] + delta[0];
+        R_SetVertex3d(&tess.verts[tess.vertexCount + 3], v3, v4, v[0]->xyz[2], 1.0, 0.0, v[0]->color);
+        tess.vertexCount += 4;
+    }
+}
+
+void __cdecl R_SetVertex3d(GfxVertex *vert, float x, float y, float z, float s, float t, const uint8_t *color)
+{
+    vert->xyzw[0] = x;
+    vert->xyzw[1] = y;
+    vert->xyzw[2] = z;
+    vert->xyzw[3] = 1.0;
+    vert->normal.packed = 0x3FFE7F7F;
+    vert->color.packed = *(uint32_t *)color;
+    vert->texCoord[0] = s;
+    vert->texCoord[1] = t;
+}
+
+void __cdecl RB_DrawLines3D(int count, int width, const GfxPointVertex *verts, bool depthTest)
+{
+    float v4; // [esp+1Ch] [ebp-74h]
+    float v5; // [esp+20h] [ebp-70h]
+    float v6; // [esp+24h] [ebp-6Ch]
+    float v7; // [esp+28h] [ebp-68h]
+    float v8; // [esp+2Ch] [ebp-64h]
+    float v9; // [esp+30h] [ebp-60h]
+    float x; // [esp+34h] [ebp-5Ch]
+    float y; // [esp+38h] [ebp-58h]
+    const float *transform; // [esp+40h] [ebp-50h]
+    float delta[2]; // [esp+44h] [ebp-4Ch] BYREF
+    float xyz[2][4]; // [esp+4Ch] [ebp-44h]
+    float invWidth; // [esp+6Ch] [ebp-24h]
+    float invHeight; // [esp+70h] [ebp-20h]
+    float offset[2][2]; // [esp+74h] [ebp-1Ch]
+    int lineIndex; // [esp+84h] [ebp-Ch]
+    const GfxPointVertex *v[2]; // [esp+88h] [ebp-8h]
+
+    if (depthTest)
+        RB_SetTessTechnique(rgp.lineMaterial, TECHNIQUE_UNLIT);
+    else
+        RB_SetTessTechnique(rgp.lineMaterialNoDepth, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_DEBUG);
+    RB_SetIdentity();
+    transform = (const float *)&gfxCmdBufSourceState.viewParms3D->viewProjectionMatrix;
+    invWidth = (double)width / (double)gfxCmdBufSourceState.renderTargetWidth;
+    invHeight = (double)width / (double)gfxCmdBufSourceState.renderTargetHeight;
+    for (lineIndex = 0; lineIndex < count; ++lineIndex)
+    {
+        v[0] = &verts[2 * lineIndex];
+        xyz[0][0] = v[0]->xyz[0] * *transform + v[0]->xyz[1] * transform[4] + v[0]->xyz[2] * transform[8] + transform[12];
+        xyz[0][1] = v[0]->xyz[0] * transform[1] + v[0]->xyz[1] * transform[5] + v[0]->xyz[2] * transform[9] + transform[13];
+        xyz[0][2] = v[0]->xyz[0] * transform[2] + v[0]->xyz[1] * transform[6] + v[0]->xyz[2] * transform[10] + transform[14];
+        xyz[0][3] = v[0]->xyz[0] * transform[3] + v[0]->xyz[1] * transform[7] + v[0]->xyz[2] * transform[11] + transform[15];
+        v[1] = &verts[2 * lineIndex + 1];
+        xyz[1][0] = v[1]->xyz[0] * *transform + v[1]->xyz[1] * transform[4] + v[1]->xyz[2] * transform[8] + transform[12];
+        xyz[1][1] = v[1]->xyz[0] * transform[1] + v[1]->xyz[1] * transform[5] + v[1]->xyz[2] * transform[9] + transform[13];
+        xyz[1][2] = v[1]->xyz[0] * transform[2] + v[1]->xyz[1] * transform[6] + v[1]->xyz[2] * transform[10] + transform[14];
+        xyz[1][3] = v[1]->xyz[0] * transform[3] + v[1]->xyz[1] * transform[7] + v[1]->xyz[2] * transform[11] + transform[15];
+        delta[0] = xyz[1][1] * xyz[0][3] - xyz[0][1] * xyz[1][3];
+        delta[1] = xyz[0][0] * xyz[1][3] - xyz[1][0] * xyz[0][3];
+        Vec2Normalize(delta);
+        delta[0] = delta[0] * invWidth;
+        delta[1] = delta[1] * invHeight;
+        offset[0][0] = xyz[0][3] * delta[0];
+        offset[0][1] = xyz[0][3] * delta[1];
+        offset[1][0] = xyz[1][3] * delta[0];
+        offset[1][1] = xyz[1][3] * delta[1];
+        RB_CheckTessOverflow(4, 6);
+        tess.indices[tess.indexCount] = LOWORD(tess.vertexCount) + 3;
+        tess.indices[tess.indexCount + 1] = tess.vertexCount;
+        tess.indices[tess.indexCount + 2] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 3] = LOWORD(tess.vertexCount) + 2;
+        tess.indices[tess.indexCount + 4] = tess.vertexCount;
+        tess.indices[tess.indexCount + 5] = LOWORD(tess.vertexCount) + 1;
+        tess.indexCount += 6;
+        y = xyz[0][1] - offset[0][1];
+        x = xyz[0][0] - offset[0][0];
+        R_SetVertex4d(&tess.verts[tess.vertexCount], x, y, xyz[0][2], xyz[0][3], 0.0, 0.0, v[0]->color);
+        v9 = xyz[1][1] - offset[1][1];
+        v8 = xyz[1][0] - offset[1][0];
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 1], v8, v9, xyz[1][2], xyz[1][3], 0.0, 1.0, v[1]->color);
+        v7 = xyz[1][1] + offset[1][1];
+        v6 = xyz[1][0] + offset[1][0];
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 2], v6, v7, xyz[1][2], xyz[1][3], 1.0, 1.0, v[1]->color);
+        v5 = xyz[0][1] + offset[0][1];
+        v4 = xyz[0][0] + offset[0][0];
+        R_SetVertex4d(&tess.verts[tess.vertexCount + 3], v4, v5, xyz[0][2], xyz[0][3], 1.0, 0.0, v[0]->color);
+        tess.vertexCount += 4;
+    }
+    RB_EndTessSurface();
+#ifdef KISAK_RADIANT
+    // LINEPROBE (TASK-1, temporary): what the DEVICE actually holds for an editor 3D line
+    // batch — the $line material/technique it resolved to, its stateBits, the blend/depth
+    // state, the CODE_MATERIAL_COLOR in effect, and the first vertex colour.  Bounded to 8
+    // lines, opt-in via RADIANT_LINEPROBE=1, so the default render path is untouched.
+    {
+        static const bool s_lineProbe = []{ const char *e = getenv("RADIANT_LINEPROBE");
+                                            return e && *e && *e != '0'; }();
+        static int s_lineProbes = 0;
+        if (s_lineProbe && s_lineProbes < 8 && count > 0)
+        {
+            ++s_lineProbes;
+            extern void Radiant_FL_Log(const char *fmt, ...);
+            const Material *m = depthTest ? rgp.lineMaterial : rgp.lineMaterialNoDepth;
+            const MaterialTechnique *tech =
+                (m && m->techniqueSet) ? m->techniqueSet->techniques[TECHNIQUE_UNLIT] : nullptr;
+            unsigned sb0 = 0, sb1 = 0; int entry = -1;
+            if (m && m->stateBitsTable)
+            {
+                entry = m->stateBitsEntry[TECHNIQUE_UNLIT];
+                if (entry != 0xFF) { sb0 = m->stateBitsTable[entry].loadBits[0];
+                                     sb1 = m->stateBitsTable[entry].loadBits[1]; }
+            }
+            IDirect3DDevice9 *dev = gfxCmdBufState.prim.device;
+            DWORD abe=9, sb=9, db=9, zw=9, zt=9, zf=9, cwe=9;
+            if (dev)
+            {
+                dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &abe);
+                dev->GetRenderState(D3DRS_SRCBLEND, &sb);
+                dev->GetRenderState(D3DRS_DESTBLEND, &db);
+                dev->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+                dev->GetRenderState(D3DRS_ZENABLE, &zt);
+                dev->GetRenderState(D3DRS_ZFUNC, &zf);
+                dev->GetRenderState(D3DRS_COLORWRITEENABLE, &cwe);
+            }
+            const float *mc = gfxCmdBufSourceState.input.consts[CONST_SRC_CODE_MATERIAL_COLOR];
+            const unsigned char *c0 = (const unsigned char *)verts[0].color;
+            Radiant_FL_Log("LINEPROBE: mtl='%s' techSet='%s' tech='%s' entry=%d loadBits=%08x/%08x "
+                           "DEV[blendEn=%lu src=%lu dst=%lu zwrite=%lu ztest=%lu zfunc=%lu cwe=%lu] "
+                           "matColor=%g %g %g %g vert0=%u,%u,%u,%u count=%d width=%d",
+                           (m && m->info.name) ? m->info.name : "?",
+                           (m && m->techniqueSet && m->techniqueSet->name) ? m->techniqueSet->name : "?",
+                           (tech && tech->name) ? tech->name : "?",
+                           entry, sb0, sb1, abe, sb, db, zw, zt, zf, cwe,
+                           mc[0], mc[1], mc[2], mc[3],
+                           (unsigned)c0[0], (unsigned)c0[1], (unsigned)c0[2], (unsigned)c0[3],
+                           count, width);
+        }
+    }
+#endif
+}
+
+void __cdecl RB_DrawLinesCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdDrawLines *cmd; // [esp+4h] [ebp-4h]
+
+    cmd = (const GfxCmdDrawLines *)execState->cmd;
+
+    if (cmd->dimensions == 2)
+    {
+        RB_DrawLines2D(cmd->lineCount, cmd->width, cmd->verts);
+    }
+    else
+    {
+#ifdef KISAK_RADIANT
+        iassert(cmd->dimensions == 3 || cmd->dimensions == 4);
+        RB_DrawLines3D(cmd->lineCount, cmd->width, cmd->verts, cmd->dimensions == 3);
+#else
+        iassert(cmd->dimensions == 3);
+        RB_DrawLines3D(cmd->lineCount, cmd->width, cmd->verts, 1);
+#endif
+    }
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+#ifdef KISAK_RADIANT
+// Editor begin-view backend handler (no kisak CoD3 equivalent). Installs the
+// view the editor set up in R_Ed_SetSceneParms as the active 3D view, so the
+// subsequent RC_DRAW_LINES (RB_DrawLines3D) transforms its world-space grid verts
+// by gfxCmdBufSourceState.viewParms3D->viewProjectionMatrix. Mirrors how kisak's
+// own scene path begins a view (rb_draw3d.cpp R_BeginView), but driven by a
+// render command instead of RB_Draw3DCommon.
+void __cdecl RB_BeginViewCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdBeginView *cmd = (const GfxCmdBeginView *)execState->cmd;
+    R_BeginView(&gfxCmdBufSourceState, &cmd->sceneDef, cmd->viewParms);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+#endif // KISAK_RADIANT
+
+void __cdecl RB_DrawTrianglesCmd(GfxRenderCommandExecState *execState)
+{
+    int stOffset; // [esp+4h] [ebp-3Ch]
+    int normalOffset; // [esp+2Ch] [ebp-14h]
+    int normalSize; // [esp+30h] [ebp-10h]
+    int indexOffset;
+    int stSize;
+    int xyzwOffset;
+    int xyzwSize;
+    int colorOffset;
+    int colorSize;
+
+    GfxCmdDrawTriangles *cmd = (GfxCmdDrawTriangles *)execState->cmd;
+
+    xyzwOffset = 16;
+    xyzwSize = 16 * cmd->vertexCount;
+
+    normalOffset = xyzwOffset + xyzwSize;
+    normalSize = 12 * cmd->vertexCount;
+
+    colorOffset = normalOffset + normalSize;
+    colorSize = 4 * cmd->vertexCount;
+
+    stOffset = colorOffset + colorSize;
+    stSize = cmd->vertexCount * 8;
+
+    indexOffset = stOffset + stSize;
+
+    RB_DrawTriangles_Internal(
+        cmd->material,
+        cmd->techType,
+        cmd->indexCount,
+        (const unsigned short *)((char *)cmd + indexOffset),
+        cmd->vertexCount,
+        (const float (*)[4])((char *)cmd + xyzwOffset),
+        (const float(*)[3])((char *)cmd + normalOffset),
+        (const GfxColor *)((char *)cmd + colorOffset),
+        (const float (*)[2])((char *)cmd + stOffset)
+    );
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawTriangles_Internal(
+    const Material *material,
+    MaterialTechniqueType techType,
+    __int16 indexCount,
+    const uint16_t *indices,
+    __int16 vertexCount,
+    const float (*xyzw)[4],
+    const float (*normal)[3],
+    const GfxColor *color,
+    const float (*st)[2])
+{
+    int index; // [esp+28h] [ebp-4h]
+    int indexa; // [esp+28h] [ebp-4h]
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    R_Set3D(&gfxCmdBufSourceState);
+    RB_SetTessTechnique(material, techType);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_DEBUG);
+    RB_CheckTessOverflow(vertexCount, indexCount);
+    for (index = 0; index < indexCount; ++index)
+        tess.indices[index + tess.indexCount] = LOWORD(tess.vertexCount) + indices[index];
+    for (indexa = 0; indexa < vertexCount; ++indexa)
+        R_SetVertex4dWithNormal(
+            &tess.verts[indexa + tess.vertexCount],
+            (*xyzw)[4 * indexa],
+            (*xyzw)[4 * indexa + 1],
+            (*xyzw)[4 * indexa + 2],
+            (*xyzw)[4 * indexa + 3],
+            (*normal)[3 * indexa],
+            (*normal)[3 * indexa + 1],
+            (*normal)[3 * indexa + 2],
+            (*st)[2 * indexa],
+            (*st)[2 * indexa + 1],
+            (const uint8_t *)&color[indexa]);
+    tess.indexCount += indexCount;
+    tess.vertexCount += vertexCount;
+    RB_EndTessSurface();
+}
+
+void __cdecl RB_DrawProfileCmd(GfxRenderCommandExecState *execState)
+{
+    PROF_SCOPED("RB_DrawProfileCmd");
+
+    GfxCmdDrawProfile *cmd = (GfxCmdDrawProfile *)execState->cmd;
+    RB_DrawProfile();
+    RB_DrawProfileScript();
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_SetMaterialColorCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdSetMaterialColor *cmd; // [esp+8h] [ebp-4h]
+
+    cmd = (const GfxCmdSetMaterialColor *)execState->cmd;
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    R_SetCodeConstantFromVec4(&gfxCmdBufSourceState, CONST_SRC_CODE_MATERIAL_COLOR, (float*)cmd->color);
+
+#ifdef KISAK_RADIANT
+    // P5.4: the editor camera draws textured materials (R_AddRenderCmdDrawTris) OUTSIDE a
+    // full scene render, so the per-scene fog code-constant setup never runs and the
+    // material's "_fog" technique variants assert on constVersions[CONST_SRC_CODE_FOG]
+    // (r_shade.cpp). The editor uses no fog, so set the no-fog default (rb_fog.cpp:29:
+    // {0,1,0,0}) + a zero fog colour here — RB_SetMaterialColorCmd is editor-emitted only
+    // (R_AddCmdSetMaterialColor) and runs once per view per frame, before the draws.
+    {
+        static float s_edNoFog[4]      = { 0.0f, 1.0f, 0.0f, 0.0f };
+        static float s_edNoFogColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        R_SetCodeConstantFromVec4(&gfxCmdBufSourceState, CONST_SRC_CODE_FOG,       s_edNoFog);
+        R_SetCodeConstantFromVec4(&gfxCmdBufSourceState, CONST_SRC_CODE_FOG_COLOR, s_edNoFogColor);
+    }
+#endif
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+#ifdef KISAK_RADIANT
+// #26 layer C2 — RB_SetCustomConstantCmd (CoD4Radiant 0x5338b0). Writes the editor
+// sun-preview custom code constant (CONST_SRC_CODE_SUN_*, carried by GfxCmdSetCustomConstant)
+// into the active source-state, so the SUNLIGHT_PREVIEW shaders read the parsed worldspawn
+// sun. The IDB wraps the set in a "changed?" guard (sub_5308F0); R_SetCodeConstantFromVec4
+// already version-stamps the constant, so the unconditional set is equivalent and simpler.
+void __cdecl RB_SetCustomConstantCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdSetCustomConstant *cmd = (const GfxCmdSetCustomConstant *)execState->cmd;
+    R_SetCodeConstantFromVec4(&gfxCmdBufSourceState, (CodeConstant)cmd->type, (float *)cmd->vec);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+#endif
+
+void __cdecl RB_SetViewportCmd(GfxRenderCommandExecState *execState)
+{
+    const GfxCmdSetViewport *cmd = (const GfxCmdSetViewport *)execState->cmd;
+
+    if (tess.indexCount)
+        RB_EndTessSurface();
+
+    R_SetViewportStruct(&gfxCmdBufSourceState, &cmd->viewport);
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawStretchPicRotate(
+    const Material *material,
+    float x,
+    float y,
+    float w,
+    float h,
+    float s0,
+    float t0,
+    float s1,
+    float t1,
+    float sinAngle,
+    float cosAngle,
+    uint32_t color,
+    GfxPrimStatsTarget statsTarget)
+{
+    float v13; // [esp+14h] [ebp-30h]
+    float v14; // [esp+18h] [ebp-2Ch]
+    float v15; // [esp+1Ch] [ebp-28h]
+    float v16; // [esp+20h] [ebp-24h]
+    float v17; // [esp+24h] [ebp-20h]
+    float v18; // [esp+28h] [ebp-1Ch]
+    float stepY; // [esp+2Ch] [ebp-18h]
+    float stepY_4; // [esp+30h] [ebp-14h]
+    float stepX; // [esp+34h] [ebp-10h]
+    float stepX_4; // [esp+38h] [ebp-Ch]
+    int indexCount; // [esp+3Ch] [ebp-8h]
+    uint16_t vertCount; // [esp+40h] [ebp-4h]
+
+    iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
+    RB_SetTessTechnique(material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, statsTarget);
+    RB_CheckTessOverflow(4, 6);
+    vertCount = tess.vertexCount;
+    indexCount = tess.indexCount;
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+    tess.indices[indexCount] = vertCount + 3;
+    tess.indices[indexCount + 1] = vertCount;
+    tess.indices[indexCount + 2] = vertCount + 2;
+    tess.indices[indexCount + 3] = vertCount + 2;
+    tess.indices[indexCount + 4] = vertCount;
+    tess.indices[indexCount + 5] = vertCount + 1;
+    stepX = w * cosAngle;
+    stepX_4 = w * sinAngle;
+    stepY = -h * sinAngle;
+    stepY_4 = h * cosAngle;
+    R_SetVertex2d(&tess.verts[vertCount], x, y, s0, t0, color);
+    v18 = y + stepX_4;
+    v17 = x + stepX;
+    R_SetVertex2d(&tess.verts[vertCount + 1], v17, v18, s1, t0, color);
+    v16 = y + stepX_4 + stepY_4;
+    v15 = x + stepX + stepY;
+    R_SetVertex2d(&tess.verts[vertCount + 2], v15, v16, s1, t1, color);
+    v14 = y + stepY_4;
+    v13 = x + stepY;
+    R_SetVertex2d(&tess.verts[vertCount + 3], v13, v14, s0, t1, color);
+}
+
+void __cdecl RB_DrawTextInSpace(
+    const char *text,
+    Font_s *font,
+    const float *org,
+    const float *xPixelStep,
+    const float *yPixelStep,
+    uint32_t color)
+{
+    float scale; // [esp+0h] [ebp-60h]
+    float scalea; // [esp+0h] [ebp-60h]
+    float scaleb; // [esp+0h] [ebp-60h]
+    float pixelWidth; // [esp+4h] [ebp-5Ch]
+    float pixelHeight; // [esp+4h] [ebp-5Ch]
+    float curOrg[3]; // [esp+20h] [ebp-40h] BYREF
+    float result[3]; // [esp+2Ch] [ebp-34h] BYREF
+    const Glyph *glyph; // [esp+38h] [ebp-28h]
+    float xyz[3]; // [esp+3Ch] [ebp-24h] BYREF
+    const Material *material; // [esp+48h] [ebp-18h]
+    uint32_t letter; // [esp+4Ch] [ebp-14h]
+    float dy[3]; // [esp+50h] [ebp-10h] BYREF
+    uint32_t newColor; // [esp+5Ch] [ebp-4h]
+
+    iassert( text );
+    iassert( font );
+    material = Material_FromHandle(font->material);
+    iassert( material );
+    if (tess.indexCount)
+        RB_EndTessSurface();
+    R_Set3D(&gfxCmdBufSourceState);
+    Vec3Mad(org, -0.5, xPixelStep, curOrg);
+    Vec3Mad(curOrg, -0.5, yPixelStep, curOrg);
+    while (*text)
+    {
+        letter = SEH_ReadCharFromString(&text, 0);
+        iassert( text );
+        glyph = R_GetCharacterGlyph(font, letter);
+        newColor = LongNoSwap(color);
+        scale = (float)glyph->x0;
+        Vec3Mad(curOrg, scale, xPixelStep, xyz);
+        scalea = (float)glyph->y0;
+        Vec3Mad(xyz, scalea, yPixelStep, xyz);
+        pixelWidth = (float)glyph->pixelWidth;
+        Vec3Scale(xPixelStep, pixelWidth, result);
+        pixelHeight = (float)glyph->pixelHeight;
+        Vec3Scale(yPixelStep, pixelHeight, dy);
+        RB_DrawCharInSpace(material, xyz, result, dy, glyph, newColor);
+        scaleb = (float)glyph->dx;
+        Vec3Mad(curOrg, scaleb, xPixelStep, curOrg);
+    }
+    if (tess.indexCount)
+        RB_EndTessSurface();
+}
+
+void __cdecl RB_DrawCharInSpace(
+    const Material *material,
+    float *xyz,
+    const float *dx,
+    const float *dy,
+    const Glyph *glyph,
+    uint32_t color)
+{
+    float v6; // [esp+18h] [ebp-30h]
+    float v7; // [esp+1Ch] [ebp-2Ch]
+    float v8; // [esp+20h] [ebp-28h]
+    float v9; // [esp+24h] [ebp-24h]
+    float v10; // [esp+28h] [ebp-20h]
+    float v11; // [esp+2Ch] [ebp-1Ch]
+    float x; // [esp+30h] [ebp-18h]
+    float y; // [esp+34h] [ebp-14h]
+    float z; // [esp+38h] [ebp-10h]
+    int indexCount; // [esp+3Ch] [ebp-Ch]
+    uint16_t vertCount; // [esp+40h] [ebp-8h]
+    GfxColor unpackedColor; // [esp+44h] [ebp-4h] BYREF
+
+    RB_SetTessTechnique(material, TECHNIQUE_UNLIT);
+    R_TrackPrims(&gfxCmdBufState, GFX_PRIM_STATS_DEBUG);
+    RB_CheckTessOverflow(4, 6);
+    vertCount = tess.vertexCount;
+    indexCount = LOWORD(tess.indexCount);
+    tess.vertexCount += 4;
+    tess.indexCount += 6;
+    tess.indices[indexCount] = vertCount + 3;
+    tess.indices[indexCount + 1] = vertCount;
+    tess.indices[indexCount + 2] = vertCount + 2;
+    tess.indices[indexCount + 3] = vertCount + 2;
+    tess.indices[indexCount + 4] = vertCount;
+    tess.indices[indexCount + 5] = vertCount + 1;
+    unpackedColor.packed = color;
+    R_SetVertex3d(
+        &tess.verts[vertCount],
+        *xyz,
+        xyz[1],
+        xyz[2],
+        glyph->s0,
+        glyph->t0,
+        (const uint8_t *)&unpackedColor);
+    z = xyz[2] + dx[2];
+    y = xyz[1] + dx[1];
+    x = *xyz + *dx;
+    R_SetVertex3d(&tess.verts[vertCount + 1], x, y, z, glyph->s1, glyph->t0, (const uint8_t *)&unpackedColor);
+    v11 = xyz[2] + dx[2] + dy[2];
+    v10 = xyz[1] + dx[1] + dy[1];
+    v9 = *xyz + *dx + *dy;
+    R_SetVertex3d(&tess.verts[vertCount + 2], v9, v10, v11, glyph->s1, glyph->t1, (const uint8_t *)&unpackedColor);
+    v8 = xyz[2] + dy[2];
+    v7 = xyz[1] + dy[1];
+    v6 = *xyz + *dy;
+    R_SetVertex3d(&tess.verts[vertCount + 3], v6, v7, v8, glyph->s0, glyph->t1, (const uint8_t *)&unpackedColor);
+}
+
+void __cdecl RB_DrawText2DCmd(GfxRenderCommandExecState *execState)
+{
+    float v1; // [esp+5Ch] [ebp-10h]
+    float cosAngle; // [esp+60h] [ebp-Ch]
+    float sinAngle; // [esp+64h] [ebp-8h]
+    const GfxCmdDrawText2D *cmd; // [esp+68h] [ebp-4h]
+
+    cmd = (const GfxCmdDrawText2D *)execState->cmd;
+    v1 = DEG2RAD( cmd->rotation );
+    cosAngle = cos(v1);
+    sinAngle = sin(v1);
+    DrawText2D(
+        cmd->text,
+        cmd->x,
+        cmd->y,
+        cmd->font,
+        cmd->xScale,
+        cmd->yScale,
+        sinAngle,
+        cosAngle,
+        cmd->color,
+        cmd->maxChars,
+        cmd->renderFlags,
+        cmd->cursorPos,
+        cmd->cursorLetter,
+        cmd->padding,
+        cmd->glowForceColor,
+        cmd->fxBirthTime,
+        cmd->fxLetterTime,
+        cmd->fxDecayStartTime,
+        cmd->fxDecayDuration,
+        cmd->fxMaterial,
+        cmd->fxMaterialGlow);
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_DrawText3DCmd(GfxRenderCommandExecState *execState)
+{
+    GfxCmdDrawText3D *cmd = (GfxCmdDrawText3D *)execState->cmd;
+
+    RB_DrawTextInSpace(cmd->text, cmd->font, cmd->org, cmd->xPixelStep, cmd->yPixelStep, cmd->color);
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_ProjectionSetCmd(GfxRenderCommandExecState *execState)
+{
+    GfxCmdProjectionSet *cmd = (GfxCmdProjectionSet *)execState->cmd;
+
+    if (cmd->projection)
+    {
+        if (cmd->projection == GFX_PROJECTION_3D)
+        {
+            if (tess.indexCount)
+                RB_EndTessSurface();
+            R_Set3D(&gfxCmdBufSourceState);
+        }
+        else if (!alwaysfails)
+        {
+            MyAssertHandler(".\\rb_backend.cpp", 2543, 0, "Invalid projection type");
+        }
+    }
+    else
+    {
+        if (tess.indexCount)
+            RB_EndTessSurface();
+        R_Set2D(&gfxCmdBufSourceState);
+    }
+
+    execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
+}
+
+void __cdecl RB_ResetStatTracking()
+{
+    RB_Stats_UpdateMaxs(&g_frameStatsCur, &backEnd.frameStatsMax);
+    memset((uint8_t *)&g_frameStatsCur, 0, sizeof(g_frameStatsCur));
+    g_viewStats = (GfxViewStats *)&g_frameStatsCur;
+}
+
+void __cdecl RB_BeginFrame(const GfxBackEndData *data)
+{
+    int hr; // [esp+0h] [ebp-4h]
+
+    backEndData = (GfxBackEndData*)data;
+    if ((data->drawType & 1) != 0)
+    {
+        ++r_glob.backEndFrameCount;
+        RB_UpdateBackEndDvarOptions();
+        RB_PatchStaticModelCache();
+        RB_PatchModelLighting(backEndData->modelLightingPatchList, backEndData->modelLightingPatchCount);
+
+        iassert(dx.device);
+        iassert(!dx.inScene);
+
+        dx.inScene = 1;
+
+        do
+        {
+            if (r_logFile && r_logFile->current.integer)
+                RB_LogPrint("dx.device->BeginScene()\n");
+            hr = dx.device->BeginScene();
+            if (hr < 0)
+            {
+                do
+                {
+                    ++g_disableRendering;
+                    Com_Error(ERR_FATAL, ".\\rb_backend.cpp (%i) dx.device->BeginScene() failed: %s\n", 2730, R_ErrorDescription(hr));
+                } while (alwaysfails);
+            }
+        } while (alwaysfails);
+
+        RB_UploadShaderStep();
+        RB_ResetStatTracking();
+        R_Cinematic_UpdateFrame();
+        tess.indexCount = 0;
+        tess.vertexCount = 0;
+    }
+}
+
+void __cdecl RB_EndFrame(char drawType)
+{
+    if ((drawType & 2) != 0)
+    {
+        if (r_logFile->current.integer)
+            RB_LogPrint("***************** RB_SwapBuffers *****************\n\n\n");
+        RB_SwapBuffers();
+        RB_UpdateLogging();
+        iassert( r_gamma );
+        iassert( r_ignoreHwGamma );
+        if (r_gamma->modified || r_ignoreHwGamma->modified)
+        {
+            Dvar_ClearModified((dvar_s*)r_gamma);
+            Dvar_ClearModified((dvar_s*)r_ignoreHwGamma);
+            if (!r_ignoreHwGamma->current.enabled)
+                R_SetColorMappings();
+        }
+    }
+}
+
+GfxIndexBufferState *RB_SwapBuffers()
+{
+    GfxIndexBufferState *result;
+    int hr;
+
+    iassert(dx.targetWindowIndex >= 0 && dx.targetWindowIndex < dx.windowCount);
+
+    {
+        PROF_SCOPED("Present");
+        hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
+    }
+
+#ifdef KISAK_RADIANT
+    // One-shot-per-window present proof (multi-window layout debug): confirms each editor
+    // view's swap chain actually Presents at its laid-out size with a success HRESULT.  A
+    // failed Present would Com_Error(ERR_FATAL) just below, so "alive + this logged ok for
+    // every window" means the views ARE presenting to screen (a white offline screen-grab is
+    // then a capture artifact, not a render failure).
+    {
+        static bool s_presentLogged[8] = { false };
+        int wi = dx.targetWindowIndex;
+        if ( wi >= 0 && wi < 8 && !s_presentLogged[wi] )
+        {
+            s_presentLogged[wi] = true;
+            extern void Radiant_FL_Log( const char *fmt, ... );
+            Radiant_FL_Log( "PRESENT: window[%d] %dx%d hr=0x%08x", wi,
+                            dx.windows[wi].width, dx.windows[wi].height, (unsigned)hr );
+        }
+    }
+#endif
+
+    if (hr < 0 && hr != -2005530520)
+    {
+        Com_Error(ERR_FATAL, "Direct3DDevice9::Present failed: %s\n", R_ErrorDescription(hr));
+    }
+
+    R_HW_InsertFence(&dx.swapFence);
+    result = gfxBuf.dynamicIndexBuffer;
+    gfxBuf.dynamicIndexBuffer->used = 0;
+    return result;
+}
+
+void RB_UpdateBackEndDvarOptions()
+{
+    if (!dx.deviceLost)
+    {
+        if (R_CheckDvarModified(r_texFilterAnisoMax)
+            || R_CheckDvarModified(r_texFilterDisable)
+            || R_CheckDvarModified(r_texFilterAnisoMin)
+            || R_CheckDvarModified(r_texFilterMipMode)
+            || R_CheckDvarModified(r_texFilterMipBias))
+        {
+            R_SetTexFilter();
+        }
+        if (R_CheckDvarModified(r_showPixelCost) && !r_showPixelCost->current.integer)
+            R_PixelCost_PrintColorCodeKey();
+        if (R_CheckDvarModified(r_aaAlpha))
+        {
+            if (gfxMetrics.hasTransparencyMsaa)
+                R_SetAlphaAntiAliasingState(gfxCmdBufState.prim.device, gfxCmdBufState.activeStateBits[0]);
+        }
+    }
+}
+
+void __cdecl RB_ExecuteRenderCommandsLoop(const void *cmds)
+{
+    const GfxCmdHeader *header; // [esp+0h] [ebp-Ch]
+    GfxRenderCommandExecState execState; // [esp+4h] [ebp-8h] BYREF
+    const void *prevCmd; // [esp+8h] [ebp-4h]
+
+    iassert(!tess.indexCount);
+
+    execState.cmd = cmds;
+    prevCmd = cmds;
+    while (1)
+    {
+        iassert((reinterpret_cast<ptype_int>(execState.cmd) & 3) == 0);
+        header = (const GfxCmdHeader *)execState.cmd;
+
+        if (!header->id)
+            break;
+
+        iassert(header->id < (sizeof(RB_RenderCommandTable) / (sizeof(RB_RenderCommandTable[0]) * (sizeof(RB_RenderCommandTable) != 4 || sizeof(RB_RenderCommandTable[0]) <= 4))));
+        iassert(RB_RenderCommandTable[header->id]);
+        RB_RenderCommandTable[header->id](&execState);
+        iassert(execState.cmd != prevCmd);
+        prevCmd = execState.cmd;
+        iassert(!g_primStats || tess.indexCount);
+    }
+    if (tess.indexCount)
+        RB_EndTessSurface();
+}
+
+void __cdecl RB_Draw3D()
+{
+    const GfxBackEndData *data; // [esp+30h] [ebp-8h]
+
+    data = backEndData;
+    if (backEndData->viewInfoCount)
+    {
+        PROF_SCOPED("ExecuteRenderCmds");
+        RB_Draw3DInternal(&data->viewInfo[data->viewInfoIndex]);
+    }
+}
+
+int RB_AdaptiveGpuSyncFinal()
+{
+    unsigned __int64 v0; // rax
+    int waitedTime; // [esp+18h] [ebp-8h]
+    int startTime; // [esp+1Ch] [ebp-4h]
+
+    LODWORD(v0) = RB_IsGpuFenceFinished();
+    if (v0)
+    {
+        if (dx.gpuSyncDelay > 0x4E20)
+        {
+            v0 = 127 * ((dx.gpuSyncDelay - 20000) / 0x80);
+            dx.gpuSyncDelay = v0;
+        }
+        else
+        {
+            dx.gpuSyncDelay = 0;
+        }
+    }
+    else
+    {
+        startTime = __rdtsc();
+        while (!RB_IsGpuFenceFinished())
+        {
+            if ((__rdtsc() - startTime) < 0)
+            {
+                RB_AbandonGpuFence();
+                break;
+            }
+        }
+        LODWORD(v0) = __rdtsc() - startTime;
+        waitedTime = v0;
+        if ((v0 & 0x80000000) == 0LL)
+        {
+            LODWORD(v0) = LODWORD(dx.gpuSyncDelay) + v0 / 16;
+            dx.gpuSyncDelay += waitedTime / 16;
+        }
+    }
+    return v0;
+}
+
+void __cdecl RB_CallExecuteRenderCommands()
+{
+    const char *v0; // eax
+    int hr; // [esp+40h] [ebp-4h]
+    
+    PROF_SCOPED("ExecuteRenderCmds");
+    if ((backEndData->drawType & 2) != 0)
+    {
+        if (g_primStats)
+            MyAssertHandler(
+                ".\\rb_backend.cpp",
+                3055,
+                0,
+                "%s\n\t(g_primStats - g_viewStats->primStats) = %i",
+                "(!g_primStats)",
+                ((char *)g_primStats - (char *)g_viewStats) / 24);
+        if (tess.indexCount)
+            MyAssertHandler(
+                ".\\rb_backend.cpp",
+                3057,
+                0,
+                "%s\n\t(tess.indexCount) = %i",
+                "(!tess.indexCount)",
+                tess.indexCount);
+        if (backEndData->viewInfoCount)
+            RB_Draw3DCommon();
+        if (tess.indexCount)
+            MyAssertHandler(
+                ".\\rb_backend.cpp",
+                3062,
+                0,
+                "%s\n\t(tess.indexCount) = %i",
+                "(!tess.indexCount)",
+                tess.indexCount);
+        R_InitCmdBufSourceState(&gfxCmdBufSourceState, &gfxCmdBufInput, 0);
+        gfxCmdBufSourceState.input.data = backEndData;
+        memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
+        memset((uint8_t *)gfxCmdBufState.vertexShaderConstState, 0, sizeof(gfxCmdBufState.vertexShaderConstState));
+        memset((uint8_t *)gfxCmdBufState.pixelShaderConstState, 0, sizeof(gfxCmdBufState.pixelShaderConstState));
+        R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
+        R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
+        RB_InitSceneViewport();
+        if (backEndData->cmds)
+            RB_ExecuteRenderCommandsLoop(backEndData->cmds);
+        if (r_drawPrimHistogram->current.enabled)
+            RB_DrawPrimHistogramOverlay();
+        if (tess.indexCount)
+            RB_EndTessSurface();
+        memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
+        if (gfxCmdBufState.prim.indexBuffer)
+            R_ChangeIndices(&gfxCmdBufState.prim, 0);
+        R_ClearAllStreamSources(&gfxCmdBufState.prim);
+        if (g_primStats)
+            MyAssertHandler(
+                ".\\rb_backend.cpp",
+                3100,
+                0,
+                "%s\n\t(g_primStats - g_viewStats->primStats) = %i",
+                "(!g_primStats)",
+                ((char *)g_primStats - (char *)g_viewStats) / 24);
+        if (tess.indexCount)
+            MyAssertHandler(
+                ".\\rb_backend.cpp",
+                3102,
+                0,
+                "%s\n\t(tess.indexCount) = %i",
+                "(!tess.indexCount)",
+                tess.indexCount);
+        iassert( dx.device );
+        iassert( dx.inScene );
+        do
+        {
+            if (r_logFile && r_logFile->current.integer)
+                RB_LogPrint("dx.device->EndScene()\n");
+            //hr = ((int(__thiscall *)(IDirect3DDevice9 *, IDirect3DDevice9 *))dx.device->EndScene)(dx.device, dx.device);
+            hr = dx.device->EndScene();
+            if (hr < 0)
+            {
+                do
+                {
+                    ++g_disableRendering;
+                    v0 = R_ErrorDescription(hr);
+                    Com_Error(ERR_FATAL, ".\\rb_backend.cpp (%i) dx.device->EndScene() failed: %s\n", 3107, v0);
+                } while (alwaysfails);
+            }
+        } while (alwaysfails);
+        dx.inScene = 0;
+        if (!r_glob.isRenderingRemoteUpdate)
+        {
+            if (dx.gpuSync)
+            {
+                R_AcquireGpuFenceLock();
+                RB_AdaptiveGpuSyncFinal();
+                if (dx.gpuSync == 2)
+                    dx.gpuSyncDelay = (unsigned __int64)(30.0 / msecPerRawTimerTick);
+                R_InsertGpuFence();
+                R_ReleaseGpuFenceLock();
+            }
+            else
+            {
+                dx.gpuSyncDelay = 0;
+            }
+        }
+    }
+}
+
+void RB_RenderThreadIdle()
+{
+    if (sys_smp_allowed->current.enabled && r_smp_backend->current.enabled)
+        R_ProcessWorkerCmdsWithTimeout(Sys_IsMainThreadReady, 1);
+    else
+        Sys_WaitForMainThread();
+}
+
+// positive sp value has been detected, the output may be wrong!
+const void *data;
+void __cdecl  RB_RenderThread(uint32_t threadContext)
+{
+    void *Value; // eax
+    signed int wait; // [esp+34h] [ebp-8h]
+    uint32_t start; // [esp+38h] [ebp-4h]
+
+    iassert(threadContext == THREAD_CONTEXT_BACKEND);
+
+    while (r_glob.haveThreadOwnership)
+        NET_Sleep(1);
+
+    while (1)
+    {
+        Value = Sys_GetValue(2);
+        if (!setjmp(*(jmp_buf *)Value))
+            break;
+        Profile_Recover(1);
+        if (r_glob.isRenderingRemoteUpdate)
+        {
+            r_glob.isRenderingRemoteUpdate = 0;
+            iassert(!r_glob.screenUpdateNotify);
+            r_glob.screenUpdateNotify = 1;
+            data = 0;
+        }
+        else if (data)
+        {
+            Com_ErrorAbort();
+        }
+    }
+    Profile_Guard(1);
+    PROF_SCOPED("RendererSleep");
+    while (1)
+    {
+        while (1)
+        {
+            {
+                PROF_SCOPED("WaitBackendEvent");
+                KISAK_NULLSUB();
+                R_ProcessWorkerCmdsWithTimeout(Sys_WaitBackendEvent, 1);
+            }
+
+            if (Sys_FinishRenderer())
+            {
+                data = Sys_RendererSleep();
+                if (data)
+                    RB_RenderCommandFrame((GfxBackEndData*)data);
+                Sys_StopRenderer();
+                //KISAK_NULLSUB();
+                RB_RenderThreadIdle();
+                Sys_StartRenderer();
+            }
+            if (r_glob.remoteScreenUpdateNesting)
+            {
+                if (!data)
+                {
+                    data = Sys_RendererSleep();
+                    if (data)
+                        RB_RenderCommandFrame((GfxBackEndData *)data);
+                }
+                iassert(!r_glob.screenUpdateNotify);
+                r_glob.screenUpdateNotify = 1;
+                iassert(!r_glob.isRenderingRemoteUpdate);
+                r_glob.isRenderingRemoteUpdate = 1;
+                do
+                {
+                    start = Sys_Milliseconds();
+#ifndef KISAK_RADIANT
+                    SCR_UpdateScreen();
+#endif
+                    wait = 33 - (Sys_Milliseconds() - start);
+                    if (wait > 0)
+                        NET_Sleep(wait);
+                } while (r_glob.remoteScreenUpdateNesting);
+                iassert(r_glob.isRenderingRemoteUpdate);
+                r_glob.isRenderingRemoteUpdate = 0;
+                iassert(!r_glob.screenUpdateNotify);
+                r_glob.screenUpdateNotify = 1;
+            }
+            if (!data)
+                break;
+        LABEL_39:
+            data = 0;
+        }
+        data = Sys_RendererSleep();
+        if (data)
+        {
+            RB_RenderCommandFrame((GfxBackEndData *)data);
+            goto LABEL_39;
+        }
+        KISAK_NULLSUB();
+        R_ProcessWorkerCmdsWithTimeout(Sys_RendererReady, 0);
+    }
+}
+
+int __cdecl RB_BackendTimeout()
+{
+    BOOL v1; // [esp+0h] [ebp-Ch]
+    _BYTE v2[4]; // [esp+8h] [ebp-4h] BYREF
+
+    if (dx.swapFence)
+    {
+        //v1 = dx.swapFence->GetData(dx.swapFence, v2, 4u, 1u) == 1;
+        v1 = dx.swapFence->GetData(v2, 4, 1) == 1;
+    }
+    else
+        v1 = 0;
+    return !v1;
+}
+
+void __cdecl RB_RenderCommandFrame(const GfxBackEndData *data)
+{
+    uint32_t drawType; // [esp+28h] [ebp-8h]
+    bool allowRendering; // [esp+2Fh] [ebp-1h]
+
+    //Profile_EndInternal(0);
+    drawType = 0;
+
+    if (R_CheckLostDevice())
+        allowRendering = g_disableRendering == 0;
+    else
+        allowRendering = 0;
+    if (allowRendering)
+    {
+        KISAK_NULLSUB();
+        RB_BeginFrame(data);
+        RB_Draw3D();
+        RB_CallExecuteRenderCommands();
+        iassert( backEndData == data );
+        drawType = backEndData->drawType;
+        backEndData = 0;
+    }
+    Sys_RenderCompleted();
+    {
+        PROF_SCOPED("WaitRenderSwap");
+        R_ProcessWorkerCmdsWithTimeout(RB_BackendTimeout, 1);
+    }
+    if (allowRendering)
+    {
+        KISAK_NULLSUB();
+        RB_EndFrame(drawType);
+    }
+    //Profile_Begin(172);
+}
+
+void __cdecl RB_InitBackendGlobalStructs()
+{
+    memset((uint8_t *)&backEnd, 0, sizeof(backEnd));
+    RB_InitSceneViewport();
+    RB_InitCodeImages();
+}
+
+void __cdecl RB_SetBspImages()
+{
+    if (rgp.world->skyImage && (rgp.world->skySamplerState & 7) == 0)
+        MyAssertHandler(
+            ".\\rb_backend.cpp",
+            3505,
+            0,
+            "%s",
+            "!rgp.world->skyImage || (rgp.world->skySamplerState & SAMPLER_FILTER_MASK)");
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_OUTDOOR] = rgp.world->outdoorImage;
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_SKY] = rgp.world->skyImage;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_SKY] = rgp.world->skySamplerState;
+}
+
+void __cdecl RB_BindDefaultImages()
+{
+    GfxCmdBufContext context; // [esp+0h] [ebp-10h]
+    uint32_t samplerIndex; // [esp+8h] [ebp-8h]
+
+    context.source = &gfxCmdBufSourceState;
+    context.state = &gfxCmdBufState;
+    for (samplerIndex = 0; samplerIndex < 0x10; ++samplerIndex)
+        R_SetSampler(context, samplerIndex, 1u, rgp.whiteImage);
+}
+
+void __cdecl RB_InitCodeImages()
+{
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_BLACK] = rgp.blackImage;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_BLACK] = SAMPLER_FILTER_NEAREST;
+    rg.codeImageNames[TEXTURE_SRC_CODE_BLACK] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_WHITE] = rgp.whiteImage;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_WHITE] = SAMPLER_FILTER_NEAREST;
+    rg.codeImageNames[TEXTURE_SRC_CODE_WHITE] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_IDENTITY_NORMAL_MAP] = rgp.identityNormalMapImage;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_IDENTITY_NORMAL_MAP] = SAMPLER_FILTER_NEAREST;
+    rg.codeImageNames[TEXTURE_SRC_CODE_IDENTITY_NORMAL_MAP] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_MODEL_LIGHTING] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_MODEL_LIGHTING] = (SAMPLER_CLAMP_MASK | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_MODEL_LIGHTING] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_SHADOWCOOKIE] = gfxRenderTargets[R_RENDERTARGET_SHADOWCOOKIE].image;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_SHADOWCOOKIE] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_SHADOWCOOKIE] = "shadowCookieSampler";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_SHADOWMAP_SUN] = gfxRenderTargets[R_RENDERTARGET_SHADOWMAP_SUN].image;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_SHADOWMAP_SUN] = gfxMetrics.shadowmapSamplerState;
+    rg.codeImageNames[TEXTURE_SRC_CODE_SHADOWMAP_SUN] = "shadowmapSamplerSun";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_SHADOWMAP_SPOT] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_SHADOWMAP_SPOT] = gfxMetrics.shadowmapSamplerState;
+    rg.codeImageNames[TEXTURE_SRC_CODE_SHADOWMAP_SPOT] = "shadowmapSamplerSpot";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_FEEDBACK] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_FEEDBACK] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_FEEDBACK] = "feedbackSampler";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_RESOLVED_POST_SUN] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_RESOLVED_POST_SUN] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_RESOLVED_POST_SUN] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_RESOLVED_SCENE] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_RESOLVED_SCENE] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_RESOLVED_SCENE] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_POST_EFFECT_0] = gfxRenderTargets[R_RENDERTARGET_POST_EFFECT_0].image;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_POST_EFFECT_0] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_POST_EFFECT_0] = "postEffect0";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_POST_EFFECT_1] = gfxRenderTargets[R_RENDERTARGET_POST_EFFECT_1].image;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_POST_EFFECT_1] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_POST_EFFECT_1] = "postEffect1";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_SKY] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_SKY] = SAMPLER_FILTER_SHIFT;
+    rg.codeImageNames[TEXTURE_SRC_CODE_SKY] = "sampler.sky";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_LIGHT_ATTENUATION] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_LIGHT_ATTENUATION] = SAMPLER_FILTER_SHIFT;
+    rg.codeImageNames[TEXTURE_SRC_CODE_LIGHT_ATTENUATION] = "attenuationSampler";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_DYNAMIC_SHADOWS] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_DYNAMIC_SHADOWS] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_DYNAMIC_SHADOWS] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_OUTDOOR] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_OUTDOOR] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_OUTDOOR] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_FLOATZ] = gfxRenderTargets[R_RENDERTARGET_FLOAT_Z].image;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_FLOATZ] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_NEAREST);
+    rg.codeImageNames[TEXTURE_SRC_CODE_FLOATZ] = 0;
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_CINEMATIC_Y] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_CINEMATIC_Y] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_CINEMATIC_Y] = "cinematicY";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_CINEMATIC_CR] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_CINEMATIC_CR] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_CINEMATIC_CR] = "cinematicCr";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_CINEMATIC_CB] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_CINEMATIC_CB] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_CINEMATIC_CB] = "cinematicCb";
+
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_CINEMATIC_A] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_CINEMATIC_A] = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_CINEMATIC_A] = "cinematicA";
+
+#ifdef KISAK_RADIANT
+    // idb RB_InitCodeImages: name the CASE_TEXTURE code sampler so R_TextureFromCodeError /
+    // R_SetSampler have a label. The actual image stays 0 here (no static code image) — it is
+    // resolved per-surface from the material colorMap by R_GetCaseTexture (r_shade.cpp).
+    // Sampler state 0x0A == SAMPLER_MIPMAP_NEAREST | SAMPLER_FILTER_LINEAR (idb).
+    gfxCmdBufInput.codeImages[TEXTURE_SRC_CODE_CASE_TEXTURE] = 0;
+    gfxCmdBufInput.codeImageSamplerStates[TEXTURE_SRC_CODE_CASE_TEXTURE] = (SAMPLER_MIPMAP_NEAREST | SAMPLER_FILTER_LINEAR);
+    rg.codeImageNames[TEXTURE_SRC_CODE_CASE_TEXTURE] = "caseTexture";
+#endif
+}
+
+void __cdecl RB_RegisterBackendAssets()
+{
+    backEnd.debugFont = R_RegisterFont("fonts/smalldevfont", 1);
+}
+

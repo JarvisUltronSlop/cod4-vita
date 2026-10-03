@@ -1,0 +1,201 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vita-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "KISAK_PLATFORM": "vita",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VITASDK}/share/vita.toolchain.cmake",
+        "KISAK_VITA_EXTERNAL_CONTENT": "ON",
+        "KISAK_VITA_VITAGL_LIBRARY": "${sourceDir}/../build/vita/vitaGL-nosplash/libvitaGL.a",
+        "KISAK_VITA_VITASHARK_LIBRARY": "${sourceDir}/../build/vita/vitaShaRK/libvitashark.a",
+        "KISAK_VITA_ALLOW_SOFTWARE_FALLBACK": "OFF",
+        "KISAK_VITA_SOURCE_RUNTIME": "ON",
+        "KISAK_VITA_CAPTURE_SOFTWARE_FRAME": "OFF",
+        "KISAK_VITA_VITA3K_NO_AUDIO": "OFF",
+        "KISAK_VITA_EXPERIMENTAL_NATIVE_ENTITY_RUNTIME": "OFF",
+        "KISAK_VITA_SMOKE_AUTOSTART_SHIPMENT": "OFF",
+        "KISAK_VITA_SMOKE_GAMEPLAY_ONLY": "OFF",
+        "KISAK_VITA_SMOKE_AUTHORED_FX_EVENT": "OFF",
+        "KISAK_VITA_MENU_ONLY": "OFF",
+        "KISAK_VITA_MENU_SCREEN": "",
+        "KISAK_VITA_SMOKE_MAP_INDEX": "",
+        "KISAK_VITA_DEBUG_NO_FRAME_EFFECTS": "OFF",
+        "KISAK_VITA_CAPTURE_OVERLAY_ONLY": "OFF",
+        "KISAK_VITA_SMOKE_LITE_ASSETS": "OFF",
+        "KISAK_VITA_NATIVE_FRAME_PROBE": "OFF",
+        "KISAK_VITA_NATIVE_DIRECT_DISPLAY_PROBE": "OFF",
+        "KISAK_VITA_NATIVE_SKIP_CLEAR_PROBE": "OFF",
+        "KISAK_VITA_NATIVE_SKIP_VIEWMODEL_PROBE": "OFF",
+        "KISAK_VITA_NATIVE_SKIP_MODEL_COLOR_PROBE": "OFF",
+        "KISAK_VITA_NATIVE_CPU_TEXTURE_UPLOAD": "OFF",
+        "KISAK_VITA_NATIVE_TRIANGLE_BUDGET": "",
+        "KISAK_VITA_BENCHMARK": "OFF"
+      }
+    },
+    {
+      "name": "vita-release",
+      "displayName": "PS Vita release (native GXM, external content)",
+      "inherits": "vita-base",
+      "binaryDir": "${sourceDir}/../build/vita/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KISAK_VITA_PROFILE": "OFF"
+      }
+    },
+    {
+      "name": "vita-benchmark",
+      "displayName": "Physical Vita controlled benchmark (explicit menu chord)",
+      "inherits": "vita-release",
+      "binaryDir": "${sourceDir}/../build/vita/benchmark-round1",
+      "cacheVariables": {
+        "KISAK_VITA_BENCHMARK": "ON"
+      }
+    },
+    {
+      "name": "vita-profile",
+      "displayName": "PS Vita profiling (native GXM, external content)",
+      "inherits": "vita-base",
+      "binaryDir": "${sourceDir}/../build/vita/profile",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "KISAK_VITA_VITAGL_LIBRARY": "${sourceDir}/../build/vita/vitaGL-profile/libvitaGL.a",
+        "KISAK_VITA_PROFILE": "ON"
+      }
+    },
+    {
+      "name": "vita3k-source-smoke",
+      "displayName": "Vita3K source gameplay diagnostic (not a release package)",
+      "inherits": "vita-profile",
+      "binaryDir": "${sourceDir}/../build/vita/source-smoke",
+      "cacheVariables": {
+        "KISAK_VITA_SMOKE_AUTOSTART_SHIPMENT": "ON"
+      }
+    },
+    {
+      "name": "vita3k-scalar-oracle",
+      "displayName": "Vita3K scalar visual oracle",
+      "inherits": "vita-base",
+      "binaryDir": "${sourceDir}/../build/vita/scalar-oracle",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KISAK_VITA_ALLOW_SOFTWARE_FALLBACK": "ON",
+        "KISAK_VITA_CAPTURE_SOFTWARE_FRAME": "ON",
+        "KISAK_VITA_VITA3K_NO_AUDIO": "ON",
+        "KISAK_VITA_PROFILE": "ON",
+        "KISAK_VITA_SOURCE_RUNTIME": "OFF"
+      }
+    },
+    {
+      "name": "vita-bootstrap",
+      "displayName": "Compatibility alias for vita-release",
+      "inherits": "vita-release"
+    },
+    {
+      "name": "vita-balanced",
+      "inherits": "vita-benchmark",
+      "binaryDir": "${sourceDir}/../build/vita/balanced",
+      "cacheVariables": {
+        "KISAK_VITA_BALANCED_CANDIDATE": "ON",
+        "KISAK_VITA_BENCHMARK_ROUND": "9"
+      }
+    },
+    {
+      "name": "vita-cpu-reference",
+      "inherits": "vita-balanced",
+      "binaryDir": "${sourceDir}/../build/vita/cpu-reference",
+      "cacheVariables": {
+        "KISAK_VITA_CPU_PROFILE": "ON",
+        "KISAK_VITA_CPU_RUNTIME": "OFF"
+      }
+    },
+    {
+      "name": "vita-cpu-candidate",
+      "inherits": "vita-balanced",
+      "binaryDir": "${sourceDir}/../build/vita/cpu-candidate",
+      "cacheVariables": {
+        "KISAK_VITA_CPU_PROFILE": "ON",
+        "KISAK_VITA_CPU_RUNTIME": "ON",
+        "KISAK_VITA_APP_ICON": "${sourceDir}/../assets/vita/icon0.png",
+        "KISAK_VITA_VITAGL_LIBRARY": "${sourceDir}/../build/vita/vitaGL-cpu-paging/libvitaGL.a"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vita-release",
+      "configurePreset": "vita-release",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 4
+    },
+    {
+      "name": "vita-profile",
+      "configurePreset": "vita-profile",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 4
+    },
+    {
+      "name": "vita3k-scalar-oracle",
+      "configurePreset": "vita3k-scalar-oracle",
+      "targets": [
+        "KisakCOD-vita-bootstrap.self-self"
+      ],
+      "jobs": 4
+    },
+    {
+      "name": "vita-bootstrap",
+      "configurePreset": "vita-bootstrap",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 4
+    },
+    {
+      "name": "vita-benchmark",
+      "configurePreset": "vita-benchmark",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 2
+    },
+    {
+      "name": "vita-balanced",
+      "configurePreset": "vita-balanced",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 2
+    },
+    {
+      "name": "vita-cpu-reference",
+      "configurePreset": "vita-cpu-reference",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 2
+    },
+    {
+      "name": "vita-cpu-candidate",
+      "configurePreset": "vita-cpu-candidate",
+      "targets": [
+        "KisakCOD-vita-bootstrap.vpk-vpk",
+        "KisakCOD-vita-source-ownership-report"
+      ],
+      "jobs": 2
+    }
+  ]
+}

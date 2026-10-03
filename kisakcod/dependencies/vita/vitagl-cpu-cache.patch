@@ -1,0 +1,366 @@
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -23,6 +23,7 @@
+ 
+ #define _GNU_SOURCE
+ #include <string.h>
++#include <psp2/kernel/processmgr.h>
+ #include "shared.h"
+ #include "utils/glsl_utils.h"
+ #include "utils/shacccg_paramquery.h"
+@@ -40,6 +41,63 @@
+ char vgl_file_cache_path[256];
+ #endif
+ #endif
++
++// CODVIT cache envelope. Payload equations and compiler options are unchanged.
++// A cache hit is admitted only after exact length, format, checksum and layout
++// validation. The application supplies its source/compiler compatibility root.
++static GLboolean cod4_cache_enabled = GL_FALSE;
++extern void vglCod4CacheEvent(unsigned event, unsigned elapsed_us, unsigned bytes) __attribute__((weak));
++void vglCod4CacheEnable(GLboolean enabled) { cod4_cache_enabled = enabled; }
++static void cod4_cache_event(unsigned event, unsigned start, unsigned bytes) {
++    if (vglCod4CacheEvent) vglCod4CacheEvent(event, sceKernelGetProcessTimeLow() - start, bytes);
++}
++typedef struct {uint32_t magic,version,bytes,kind;uint64_t checksum;} cod4_cache_header;
++static void cod4_cache_reject(const char *path) {
++    // Invalid data is not needed for recovery. Remove this single cache entry;
++    // no content, source asset, or other title's cache is ever selected here.
++    sceIoRemove(path);
++}
++void *vglCod4CacheRead(const char *path, size_t *bytes, unsigned kind) {
++    unsigned start = sceKernelGetProcessTimeLow();
++    *bytes = 0;
++    if (!cod4_cache_enabled) {cod4_cache_event(0,start,0);return NULL;}
++    SceUID file = sceIoOpen(path,SCE_O_RDONLY,0);
++    if (file < 0) {cod4_cache_event(2,start,0);return NULL;}
++    cod4_cache_header header;
++    SceOff length = sceIoLseek(file,0,SCE_SEEK_END);
++    sceIoLseek(file,0,SCE_SEEK_SET);
++    GLboolean valid = sceIoRead(file,&header,sizeof(header)) == sizeof(header)
++        && header.magic == 0x31435643 && header.version == 1 && header.kind == kind
++        && header.bytes >= 16 && header.bytes <= 4*1024*1024
++        && length == sizeof(header) + (uint64_t)header.bytes;
++    void *data = valid ? vglMalloc(header.bytes) : NULL;
++    if (data) valid = sceIoRead(file,data,header.bytes) == header.bytes
++        && VITAGL_XXH3_64bits(data,header.bytes) == header.checksum;
++    else valid = GL_FALSE;
++    sceIoClose(file);
++    if (valid && kind == 0) valid = header.bytes >= 64
++        && sceGxmProgramGetSize(data) == header.bytes && sceGxmProgramCheck(data) == 0;
++    if (!valid) {
++        if (data) vgl_free(data);
++        cod4_cache_reject(path);cod4_cache_event(3,start,0);return NULL;
++    }
++    *bytes=header.bytes;cod4_cache_event(1,start,header.bytes);return data;
++}
++void vglCod4CacheWrite(const char *path,const void *data,size_t bytes,unsigned kind) {
++    unsigned start=sceKernelGetProcessTimeLow();
++    if (!cod4_cache_enabled) return;
++    if (!data || bytes<16 || bytes>4*1024*1024) {cod4_cache_event(5,start,0);return;}
++    char pending[288];
++    if (snprintf(pending,sizeof(pending),"%s.pending",path) >= sizeof(pending)) {cod4_cache_event(5,start,0);return;}
++    cod4_cache_header header={0x31435643,1,(uint32_t)bytes,kind,VITAGL_XXH3_64bits(data,bytes)};
++    SceUID file=sceIoOpen(pending,SCE_O_CREAT|SCE_O_WRONLY|SCE_O_TRUNC,0777);
++    GLboolean valid=file>=0 && sceIoWrite(file,&header,sizeof(header))==sizeof(header)
++        && sceIoWrite(file,data,bytes)==bytes && sceIoSyncByFd(file,0)>=0;
++    if(file>=0 && sceIoClose(file)<0) valid=GL_FALSE;
++    if(valid) valid=sceIoRename(pending,path)>=0;
++    if(!valid)sceIoRemove(pending);
++    cod4_cache_event(valid?4:5,start,bytes);
++}
+ 
+ #define MAX_CUSTOM_SHADERS 2048 // Maximum number of linkable custom shaders
+ #define MAX_CUSTOM_PROGRAMS 1024 // Maximum number of linkable custom programs
+@@ -553,6 +611,7 @@
+ 	if (!_out) {
+ 		_out = vglMalloc(*sz);
+ 	}
++	if (!_out) return NULL;
+ 	uint8_t *buf = (uint8_t *)_out;
+ 	vgl_fast_memcpy(buf, &matrix_uniforms_num, sizeof(uint32_t));
+ 	buf += sizeof(uint32_t);
+@@ -579,43 +638,58 @@
+ 	return _out;
+ }
+ 
+-void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings) {
+-	uint8_t *buf = (uint8_t *)in;
+-	uint32_t matrix_uniforms_num;
+-	vgl_fast_memcpy(&matrix_uniforms_num, buf, sizeof(uint32_t));
+-	buf += sizeof(uint32_t) * (matrix_uniforms_num + 1);
+-	if (load_bindings) {
+-		vgl_fast_memcpy(&s->semantics, buf, sizeof(binds_map));
+-		buf += sizeof(binds_map);
+-	}
++GLboolean unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings) {
++    if (!in || sz<4) return GL_FALSE;
++    uint32_t count;vgl_fast_memcpy(&count,in,4);
++    if (count>4096 || count>(sz-4)/4) return GL_FALSE;
++    size_t offset=4+(size_t)count*4;
++    binds_map semantics;
++    if(load_bindings) {
++        if(sizeof(binds_map)>sz-offset)return GL_FALSE;
++        vgl_fast_memcpy(&semantics,(uint8_t *)in+offset,sizeof(semantics));offset+=sizeof(semantics);
++    }
+ #ifdef HAVE_GLSL_TEXTURE_SIZE
+-	s->sized_samplers_num = *buf;
+-	buf++;
+-	if (s->sized_samplers_num) {
+-		vgl_fast_memcpy(s->sized_samplers, buf, sizeof(glsl_samplers_info) * s->sized_samplers_num);
+-		buf += sizeof(glsl_samplers_info) * s->sized_samplers_num;
+-	}
+-#endif
+-	s->size = sz - ((uintptr_t)buf - (uintptr_t)in);
+-	s->prog = (SceGxmProgram *)vglMalloc(s->size);
+-	vgl_fast_memcpy((SceGxmProgram *)s->prog, buf, s->size);
+-	sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, s->prog, &s->id);
+-	s->unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(s->prog);
+-	if (matrix_uniforms_num) {
+-		uint32_t *_m = (uint32_t *)in + 1;
+-		uint32_t *ptr = vglProgramGetParameterBase(s->prog);
+-		for (int i = 0; i < matrix_uniforms_num; i++) {
+-			matrix_uniform *m = vglMalloc(sizeof(matrix_uniform));
+-			m->chain = s->mat;
+-			m->ptr = (SceGxmProgramParameter *)(ptr + _m[i] * 4);
+-			s->mat = m;
+-		}
+-	}
++    if(offset>=sz)return GL_FALSE;
++    unsigned samplers=((uint8_t *)in)[offset++];
++    if(samplers>sizeof(s->sized_samplers)/sizeof(s->sized_samplers[0])
++        || samplers*sizeof(glsl_samplers_info)>sz-offset)return GL_FALSE;
++    const void *sampler_data=(uint8_t *)in+offset;offset+=samplers*sizeof(glsl_samplers_info);
++#endif
++    if(sz-offset<64)return GL_FALSE;
++    SceGxmProgram *program=vglMalloc(sz-offset);
++    if(!program)return GL_FALSE;
++    vgl_fast_memcpy(program,(uint8_t *)in+offset,sz-offset);
++    if(sceGxmProgramGetSize(program)!=sz-offset || sceGxmProgramCheck(program)!=0) {vgl_free(program);return GL_FALSE;}
++    uint32_t parameters=sceGxmProgramGetParameterCount(program);
++    matrix_uniform *matrices=NULL;
++    for(uint32_t i=0;i<count;++i) {
++        uint32_t index;vgl_fast_memcpy(&index,(uint8_t *)in+4+i*4,4);
++        matrix_uniform *m=index<parameters?vglMalloc(sizeof(matrix_uniform)):NULL;
++        if(!m) {
++            while(matrices){matrix_uniform *next=matrices->chain;vgl_free(matrices);matrices=next;}
++            vgl_free(program);return GL_FALSE;
++        }
++        m->chain=matrices;m->ptr=(SceGxmProgramParameter *)((uint32_t *)vglProgramGetParameterBase(program)+index*4);matrices=m;
++    }
++    SceGxmShaderPatcherId id;
++    if(sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher,program,&id)<0) {
++        while(matrices){matrix_uniform *next=matrices->chain;vgl_free(matrices);matrices=next;}
++        vgl_free(program);return GL_FALSE;
++    }
++    s->size=sz-offset;s->prog=program;s->id=id;s->mat=matrices;
++    s->unif_buf_size=sceGxmProgramGetDefaultUniformBufferSize(program);
++    if(load_bindings)s->semantics=semantics;
++#ifdef HAVE_GLSL_TEXTURE_SIZE
++    s->sized_samplers_num=samplers;
++    if(samplers)vgl_fast_memcpy(s->sized_samplers,sampler_data,samplers*sizeof(glsl_samplers_info));
++#endif
++    return GL_TRUE;
+ }
+ 
+ #ifdef HAVE_SHADER_CACHE
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv, fname)
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings, const char *cache_fname) {
++	unsigned cod4_compile_start=sceKernelGetProcessTimeLow();
+ #else
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv)
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings) {
+@@ -661,12 +735,11 @@
+ #endif
+ 	shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
+-	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+ 	size_t sz;
+ 	void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+-	sceIoWrite(f, buf, sz);
+-	sceIoClose(f);
+-	vgl_free(buf);
++	cod4_cache_event(6,cod4_compile_start,s->size);
++	vglCod4CacheWrite(cache_fname,buf,sz,save_bindings?2:1);
++	if(buf)vgl_free(buf);
+ #endif
+ }
+ 
+@@ -1759,18 +1832,11 @@
+ #ifdef HAVE_SHADER_CACHE
+ 	char fname[256];
+ 	sprintf(fname, "%s/%s/%llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", XXH3_64bits(s->source, s->size));
+-	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+-	if (f >= 0) {
+-		vgl_free(s->source);
+-		s->source = NULL;
+-		size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+-		sceIoLseek(f, 0, SCE_SEEK_SET);
+-		void *buf = vglMalloc(sz);
+-		sceIoRead(f, buf, sz);
+-		sceIoClose(f);
+-		unserialize_shader(buf, sz, s, GL_FALSE);
+-		vgl_free(buf);
+-		return;
++	size_t sz=0;void *buf=vglCod4CacheRead(fname,&sz,1);
++	if(buf) {
++		GLboolean valid=unserialize_shader(buf,sz,s,GL_FALSE);vgl_free(buf);
++		if(valid){vgl_free(s->source);s->source=NULL;return;}
++		cod4_cache_reject(fname);cod4_cache_event(3,sceKernelGetProcessTimeLow(),0);
+ 	}
+ #endif
+ 
+@@ -2137,27 +2203,17 @@
+ 		char *fname;
+ 		if (!p->vshader->prog) {
+ 			sprintf(vert_fname, "%s/v/%llX.gxp", vgl_shader_cache_path, XXH3_64bits(p->vshader->source, p->vshader->size));
+-			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
+-			if (f >= 0) {
+-				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+-				sceIoLseek(f, 0, SCE_SEEK_SET);
+-				void *buf = vglMalloc(sz);
+-				sceIoRead(f, buf, sz);
+-				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->vshader, GL_TRUE);
++			size_t sz=0;void *buf=vglCod4CacheRead(vert_fname,&sz,2);
++			if(buf) {
++				if(!unserialize_shader(buf,sz,p->vshader,GL_TRUE)){cod4_cache_reject(vert_fname);cod4_cache_event(3,sceKernelGetProcessTimeLow(),0);}
+ 				vgl_free(buf);
+ 			}
+ 		}
+ 		if (!p->fshader->prog) {
+ 			sprintf(frag_fname, "%s/f/%llX.gxp", vgl_shader_cache_path, XXH3_64bits(p->fshader->source, p->fshader->size));
+-			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
+-			if (f >= 0) {
+-				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+-				sceIoLseek(f, 0, SCE_SEEK_SET);
+-				void *buf = vglMalloc(sz);
+-				sceIoRead(f, buf, sz);
+-				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->fshader, GL_TRUE);
++			size_t sz=0;void *buf=vglCod4CacheRead(frag_fname,&sz,2);
++			if(buf) {
++				if(!unserialize_shader(buf,sz,p->fshader,GL_TRUE)){cod4_cache_reject(frag_fname);cod4_cache_event(3,sceKernelGetProcessTimeLow(),0);}
+ 				vgl_free(buf);
+ 			}
+ 		}
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -29,6 +29,7 @@
+ #endif
+ #include "shaders/tex_env.h"
+ #include "shared.h"
++#include <psp2/kernel/processmgr.h>
+ 
+ #define setup_lighting_attributes(type, type2, attr) \
+ 	if (mask.has_colors && color_material_state && (color_material_mode == type || color_material_mode == type2)) { \
+@@ -640,19 +641,14 @@
+ 	if (ffp_dirty_vert) {
+ 		char fname[256];
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+-		sprintf(fname, "ux0:data/shader_cache/v%d/v/%016llX-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
++		sprintf(fname, "%s/ffp-v/%016llX-%d.gxp", vgl_shader_cache_path, vert_shader_mask, WVP_ON_GPU);
+ #else
+-		sprintf(fname, "ux0:data/shader_cache/v%d/v/%08X-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
+-#endif
+-		SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+-		if (f >= 0) {
+-			// Gathering the precompiled shader from cache
+-			uint32_t size = sceIoLseek(f, 0, SCE_SEEK_END);
+-			sceIoLseek(f, 0, SCE_SEEK_SET);
+-			ffp_vertex_program = (SceGxmProgram *)vglMalloc(size);
+-			sceIoRead(f, ffp_vertex_program, size);
+-			sceIoClose(f);
+-		} else {
++		sprintf(fname, "%s/ffp-v/%08X-%d.gxp", vgl_shader_cache_path, vert_shader_mask, WVP_ON_GPU);
++#endif
++		size_t cod4_cached_size=0;
++		ffp_vertex_program=vglCod4CacheRead(fname,&cod4_cached_size,0);
++		if (!ffp_vertex_program) {
++			unsigned cod4_compile_start=sceKernelGetProcessTimeLow();
+ 			// Restarting vitaShaRK if we released it before
+ 			if (!is_shark_online)
+ 				start_shader_compiler();
+@@ -667,9 +663,8 @@
+ 			shark_clear_output();
+ 				
+ 			// Saving compiled shader in filesystem cache
+-			f = sceIoOpen(fname, SCE_O_WRONLY | SCE_O_TRUNC | SCE_O_CREAT, 0777);
+-			sceIoWrite(f, ffp_vertex_program, size);
+-			sceIoClose(f);
++			if(vglCod4CacheEvent)vglCod4CacheEvent(6,sceKernelGetProcessTimeLow()-cod4_compile_start,size);
++			vglCod4CacheWrite(fname,ffp_vertex_program,size,0);
+ 		}
+ 		sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, ffp_vertex_program, &ffp_vertex_program_id);
+ 		ffp_vertex_unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(ffp_vertex_program);
+@@ -853,26 +848,21 @@
+ 		char fname[256];
+ #ifndef DISABLE_TEXTURE_COMBINER
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+-		sprintf(fname, "ux0:data/shader_cache/v%d/f/%016llX-%016llX-%08X.gxp", FFP_SHADER_CACHE_MAGIC, frag_shader_mask, cmb_mask.raw_high, cmb_mask.raw_low);
++		sprintf(fname, "%s/ffp-f/%016llX-%016llX-%08X.gxp", vgl_shader_cache_path, frag_shader_mask, cmb_mask.raw_high, cmb_mask.raw_low);
+ #else
+-		sprintf(fname, "ux0:data/shader_cache/v%d/f/%08X-%016llX.gxp", FFP_SHADER_CACHE_MAGIC, frag_shader_mask, cmb_mask.raw);
++		sprintf(fname, "%s/ffp-f/%08X-%016llX.gxp", vgl_shader_cache_path, frag_shader_mask, cmb_mask.raw);
+ #endif
+ #else
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+-		sprintf(fname, "ux0:data/shader_cache/v%d/f/%016llX-0000000000000000.gxp", FFP_SHADER_CACHE_MAGIC, frag_shader_mask);
++		sprintf(fname, "%s/ffp-f/%016llX-0000000000000000.gxp", vgl_shader_cache_path, frag_shader_mask);
+ #else
+-		sprintf(fname, "ux0:data/shader_cache/v%d/f/%08X-0000000000000000.gxp", FFP_SHADER_CACHE_MAGIC, frag_shader_mask);
+-#endif
+-#endif
+-		SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+-		if (f >= 0) {
+-			// Gathering the precompiled shader from cache
+-			uint32_t size = sceIoLseek(f, 0, SCE_SEEK_END);
+-			sceIoLseek(f, 0, SCE_SEEK_SET);
+-			ffp_fragment_program = (SceGxmProgram *)vglMalloc(size);
+-			sceIoRead(f, ffp_fragment_program, size);
+-			sceIoClose(f);
+-		} else {
++		sprintf(fname, "%s/ffp-f/%08X-0000000000000000.gxp", vgl_shader_cache_path, frag_shader_mask);
++#endif
++#endif
++		size_t cod4_cached_size=0;
++		ffp_fragment_program=vglCod4CacheRead(fname,&cod4_cached_size,0);
++		if (!ffp_fragment_program) {
++			unsigned cod4_compile_start=sceKernelGetProcessTimeLow();
+ 			// Restarting vitaShaRK if we released it before
+ 			if (!is_shark_online)
+ 				start_shader_compiler();
+@@ -947,9 +937,8 @@
+ 			shark_clear_output();
+ 
+ 			// Saving compiled shader in filesystem cache
+-			f = sceIoOpen(fname, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+-			sceIoWrite(f, ffp_fragment_program, size);
+-			sceIoClose(f);
++			if(vglCod4CacheEvent)vglCod4CacheEvent(6,sceKernelGetProcessTimeLow()-cod4_compile_start,size);
++			vglCod4CacheWrite(fname,ffp_fragment_program,size,0);
+ 		}
+ 		sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, ffp_fragment_program, &ffp_fragment_program_id);
+ 		ffp_fragment_unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(ffp_fragment_program);
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1392,3 +1392,8 @@
+ 	}
+ }
+ #endif
++
++extern char vgl_shader_cache_path[256];
++extern void *vglCod4CacheRead(const char *path,size_t *bytes,unsigned kind);
++extern void vglCod4CacheWrite(const char *path,const void *data,size_t bytes,unsigned kind);
++extern void vglCod4CacheEvent(unsigned event,unsigned elapsed_us,unsigned bytes) __attribute__((weak));
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -197,6 +197,8 @@
+ 	sceIoMkdir(fname, 0777);
+ 	sprintf(fname, "%s/f", vgl_shader_cache_path);
+ 	sceIoMkdir(fname, 0777);
++	sprintf(fname,"%s/ffp-v",vgl_shader_cache_path);sceIoMkdir(fname,0777);
++	sprintf(fname,"%s/ffp-f",vgl_shader_cache_path);sceIoMkdir(fname,0777);
+ #endif
+ 	// Check if framebuffer size is valid
+ 	GLboolean res_fallback = GL_FALSE;

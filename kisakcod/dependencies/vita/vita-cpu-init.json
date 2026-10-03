@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "baseRevision": "3d035da150549cb38a83811f75856a121754cd5d",
+  "baseCachePatchSha256": "215338603d53d415b589eb33fb460815a10922b1c0868c4ab3dab631bb60b8a5",
+  "patch": "vitagl-cpu-init.patch",
+  "patchSha256": "e890b015b377d2fa3460c11d35282156eaa74d2fbec3aa5a3ca3bc57cfe5b4ab",
+  "failurePolicy": "Startup failure exits the process after application workers are joined and records flushed; kernel reclaims partial GXM allocations. No in-process retry.",
+  "shaderChanges": false
+}

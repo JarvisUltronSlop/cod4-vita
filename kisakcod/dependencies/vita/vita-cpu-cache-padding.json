@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "baseRevision": "3d035da150549cb38a83811f75856a121754cd5d",
+  "baseCachePatchSha256": "215338603d53d415b589eb33fb460815a10922b1c0868c4ab3dab631bb60b8a5",
+  "baseInitializationPatchSha256": "e890b015b377d2fa3460c11d35282156eaa74d2fbec3aa5a3ca3bc57cfe5b4ab",
+  "patch": "vitagl-cpu-cache-padding.patch",
+  "patchSha256": "a7a6aab476129fdc6c43ae475e2741dbbf2d6dcc18db883fd8b8438fbb151c28",
+  "cacheFormat": 1,
+  "shaderCompatibilityChanged": false,
+  "reason": "Backward-compatible reader correction: accept only exact GXM declared size or its four-byte aligned compiler buffer length, preserving full checksum/native program validation."
+}

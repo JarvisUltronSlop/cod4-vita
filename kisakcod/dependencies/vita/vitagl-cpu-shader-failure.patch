@@ -1,0 +1,184 @@
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -622,6 +622,9 @@
+ }
+ 
+ void *serialize_shader(void *out, size_t *sz, shader *s, GLboolean save_bindings) {
++    if (!sz) return NULL;
++    *sz = 0;
++    if (!s || !s->prog || s->size < 64) return NULL;
+ 	uint32_t matrix_uniforms_num;
+ 	*sz = serialized_shader_size(s, save_bindings, &matrix_uniforms_num);
+ 	void *_out = out;
+@@ -703,61 +706,107 @@
+     return GL_TRUE;
+ }
+ 
++// COD4: compiler diagnostics are bounded, renderer-owned and copied by the
++// host callback before the compiler output/source is released. No file I/O here.
++extern void vglCod4ShaderMessage(unsigned type, uint64_t identity, unsigned reason,
++    int line, const char *message) __attribute__((weak));
++static unsigned cod4_shader_type, cod4_shader_messages;
++static uint64_t cod4_shader_identity;
++static const char *cod4_shader_source;
++static void cod4_shader_message(unsigned reason, int line, const char *message) {
++    if (!vglCod4ShaderMessage) return;
++    char bounded[513];size_t n=0;
++    while(message && message[n] && n<sizeof(bounded)-1){bounded[n]=message[n];++n;}
++    bounded[n]=0;
++    vglCod4ShaderMessage(cod4_shader_type,cod4_shader_identity,reason,line,bounded);
++}
++static void cod4_shader_log(const char *message, shark_log_level level, int line) {
++    if(level!=SHARK_LOG_ERROR)return;
++    if(cod4_shader_messages++>=8){if(cod4_shader_messages==9)cod4_shader_message(15,line,"Further compiler errors omitted");return;}
++    cod4_shader_message(1,line,message);
++    // Include the translated source line identified by the compiler.
++    if(cod4_shader_source && line>0 && line<100000) {
++        const char *p=cod4_shader_source;int current=1;
++        while(*p && current<line){if(*p++=='\n')++current;}
++        if(current==line && *p){char text[257];unsigned n=0;while(*p && *p!='\n' && n<256)text[n++]=*p++;text[n]=0;cod4_shader_message(2,line,text);}
++    }
++}
++static void cod4_shader_restore_log(void) {
++#if defined(HAVE_SHARK_LOG) || defined(LOG_ERRORS)
++    shark_install_log_cb(shark_log_cb);
++#else
++    shark_install_log_cb(NULL);
++#endif
++}
++static void cod4_shader_release_metadata(shader *s) {
++    while(s->mat){matrix_uniform *next=s->mat->chain;vgl_free(s->mat);s->mat=next;}
++    while(s->unif_blk){block_uniform *next=s->unif_blk->chain;vgl_free(s->unif_blk);s->unif_blk=next;}
++}
+ #ifdef HAVE_SHADER_CACHE
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv, fname)
+-static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings, const char *cache_fname) {
+-	unsigned cod4_compile_start=sceKernelGetProcessTimeLow();
++static inline __attribute__((always_inline)) GLboolean compile_shader(shader *s, GLboolean save_bindings, const char *cache_fname) {
++    unsigned cod4_compile_start=sceKernelGetProcessTimeLow();
+ #else
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv)
+-static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings) {
+-#endif
+-	// Compiling shader source
+-	s->prog = shark_compile_shader_extended((const char *)s->source, &s->size, s->type == GL_FRAGMENT_SHADER ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+-	if (s->prog) {
+-		vgl_free(s->source);
+-		s->source = NULL;
+-		SceGxmProgram *res = (SceGxmProgram *)vglMalloc(s->size);
+-		vgl_fast_memcpy((void *)res, (void *)s->prog, s->size);
+-		int r = sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, res, &s->id);
+-#ifdef LOG_ERRORS
+-		if (r) {
+-			vgl_log("%s:%d %s: Program failed to register on sceGxm (%s).\n", __FILE__, __LINE__, __func__, get_gxm_error_literal(r));
+-		}
+-#endif
+-		s->unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(res);
+-		s->prog = res;
+-		SceShaccCgCompileOutput *cout = (SceShaccCgCompileOutput *)shark_get_internal_compile_output();
+-		SceShaccCgParameter param = sceShaccCgGetFirstParameter(cout);
+-		while (param) {
+-			if (sceShaccCgGetParameterClass(param) == SCE_SHACCCG_PARAMETERCLASS_MATRIX) {
+-				matrix_uniform *m = (matrix_uniform *)vglMalloc(sizeof(matrix_uniform));
+-				m->ptr = sceGxmProgramFindParameterByName(s->prog, sceShaccCgGetParameterName(param));
+-				m->chain = s->mat;
+-				s->mat = m;
+-			} else if (sceShaccCgGetParameterClass(param) == SCE_SHACCCG_PARAMETERCLASS_UNIFORMBLOCK) {
+-				block_uniform *b = (block_uniform *)vglMalloc(sizeof(block_uniform));
+-				b->idx = sceShaccCgGetParameterBufferIndex(param);
+-				strcpy(b->name, sceShaccCgGetParameterName(param));
+-				b->chain = s->unif_blk;
+-				s->unif_blk = b;
+-			}
+-			param = sceShaccCgGetNextParameter(param);
+-		}
+-	}
+-#ifdef HAVE_SHARK_LOG
+-	if (s->log)
+-		vgl_free(s->log);
+-	s->log = shark_log;
+-	shark_log = NULL;
+-#endif
+-	shark_clear_output();
++static inline __attribute__((always_inline)) GLboolean compile_shader(shader *s, GLboolean save_bindings) {
++#endif
++    // Preserve source size on failure; a compiler failure must never be
++    // interpreted as a nonzero compiled length or serialized as a program.
++    uint32_t compiled_size=s->size;SceGxmProgram *res=NULL;GLboolean registered=GL_FALSE;
++    unsigned failure=10;
++    cod4_shader_type=s->type;cod4_shader_messages=0;cod4_shader_source=s->source;
++    cod4_shader_identity=s->source?XXH3_64bits(s->source,s->size):0;
++    shark_install_log_cb(cod4_shader_log);
++    const SceGxmProgram *compiled=shark_compile_shader_extended(s->source,&compiled_size,
++        s->type==GL_FRAGMENT_SHADER?SHARK_FRAGMENT_SHADER:SHARK_VERTEX_SHADER,
++        compiler_opts,compiler_fastmath,compiler_fastprecision,compiler_fastint);
++    if(!compiled || compiled_size<64)goto failed;
++    failure=11;res=(SceGxmProgram *)vglMalloc(compiled_size);if(!res)goto failed;
++    vgl_fast_memcpy(res,compiled,compiled_size);
++    failure=12;if(sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher,res,&s->id)<0)goto failed;
++    registered=GL_TRUE;
++    {
++        SceShaccCgCompileOutput *output=(SceShaccCgCompileOutput *)shark_get_internal_compile_output();
++        failure=13;if(!output)goto failed;
++        SceShaccCgParameter param=sceShaccCgGetFirstParameter(output);
++        while(param) {
++            if(sceShaccCgGetParameterClass(param)==SCE_SHACCCG_PARAMETERCLASS_MATRIX) {
++                matrix_uniform *m=(matrix_uniform *)vglMalloc(sizeof(matrix_uniform));if(!m)goto failed;
++                m->ptr=sceGxmProgramFindParameterByName(res,sceShaccCgGetParameterName(param));
++                m->chain=s->mat;s->mat=m;
++            } else if(sceShaccCgGetParameterClass(param)==SCE_SHACCCG_PARAMETERCLASS_UNIFORMBLOCK) {
++                const char *name=sceShaccCgGetParameterName(param);
++                block_uniform *b=(block_uniform *)vglMalloc(sizeof(block_uniform));if(!b)goto failed;
++                if(!name || strlen(name)>=sizeof(b->name)){vgl_free(b);goto failed;}
++                b->idx=sceShaccCgGetParameterBufferIndex(param);strcpy(b->name,name);
++                b->chain=s->unif_blk;s->unif_blk=b;
++            }
++            param=sceShaccCgGetNextParameter(param);
++        }
++    }
++    s->prog=res;s->size=compiled_size;s->unif_buf_size=sceGxmProgramGetDefaultUniformBufferSize(res);
++    vgl_free(s->source);s->source=NULL;cod4_shader_source=NULL;
++    cod4_shader_restore_log();shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
+-	size_t sz;
+-	void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+-	cod4_cache_event(6,cod4_compile_start,s->size);
+-	vglCod4CacheWrite(cache_fname,buf,sz,save_bindings?2:1);
+-	if(buf)vgl_free(buf);
+-#endif
++    {
++        size_t size=0;void *buf=serialize_shader(NULL,&size,s,save_bindings);
++        cod4_cache_event(6,cod4_compile_start,s->size);
++        if(buf){vglCod4CacheWrite(cache_fname,buf,size,save_bindings?2:1);vgl_free(buf);}
++        else cod4_cache_event(5,cod4_compile_start,0);
++    }
++#endif
++    return GL_TRUE;
++failed:
++    cod4_shader_message(failure,-1,failure==10?"Compiler returned no valid program":failure==11?"Program allocation failed":failure==12?"Program registration failed":"Program metadata allocation failed");
++    cod4_shader_release_metadata(s);
++    if(registered)sceGxmShaderPatcherUnregisterProgram(gxm_shader_patcher,s->id);
++    if(res)vgl_free(res);
++    s->prog=NULL;s->id=0;s->unif_buf_size=0;cod4_shader_source=NULL;
++    cod4_shader_restore_log();shark_clear_output();
++#ifdef HAVE_SHADER_CACHE
++    cod4_cache_event(10,cod4_compile_start,0);
++#endif
++    return GL_FALSE;
+ }
+ 
+ void reset_custom_shaders(void) {
+@@ -2253,6 +2302,13 @@
+ 			}
+ 		}
+ 
++        // Compilation can fail after postponed translation. Do not mark the
++        // program linked, dereference absent shader metadata or change globals.
++        if (!p->vshader->prog || !p->fshader->prog) {
++            glsl_sema_mode = VGL_MODE_POSTPONED;
++            p->status = PROG_UNLINKED;
++            return;
++        }
+ 		// Setting progressive default attribute bindings
+ 		set_default_attrib_binding();
+ 

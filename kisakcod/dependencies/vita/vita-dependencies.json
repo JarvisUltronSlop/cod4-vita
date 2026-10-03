@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "openalSoft": {
+    "sourceUrl": "https://github.com/kcat/openal-soft/archive/refs/tags/openal-soft-1.19.1.tar.gz",
+    "sourceSha256": "9f3536ab2bb7781dbafabc6a61e0b34b17edd16bd6c2eaf2ae71bc63078f98c7",
+    "vitaPatchSource": "https://github.com/isage/openal-soft/blob/27239f784496a5188fc5350c8c3c74a30ec98b98/openal-soft-1.19.1-vita-1.patch",
+    "patch": "openal-soft-vita.patch",
+    "patchSha256": "a31ebc39966298e31d2d77d43e9ac4352bd1b0a0f6d9f0f0e372a849bca349bf",
+    "hostToolsPatch": "openal-soft-host-tools.patch",
+    "hostToolsPatchSha256": "e3bd48e65488b03ad81fc21b2ed544edb38e13b3f12b09dc4fb3c6138a649a9d",
+    "voiceMemoryPatch": "openal-soft-voice-memory.patch",
+    "voiceMemoryPatchSha256": "d5d06ac95ea1f42d9804acc7cf1884ade23c312b5ed442303e1e36a91e914081"
+  },
+  "vitaShaRK": {
+    "repository": "https://github.com/Rinnegatamante/vitaShaRK.git",
+    "revision": "df24065e65098b2d1ac533760109ad4367573f28"
+  },
+  "vitaGL": {
+    "repository": "https://github.com/Rinnegatamante/vitaGL.git",
+    "revision": "3d035da150549cb38a83811f75856a121754cd5d",
+    "patch": "vitagl-local.patch",
+    "patchSha256": "67c491a7c023fb5b40ac2febdc8b6d66ea30d25fba43abafdd2cf6a68f5b73a1",
+    "flags": {
+      "NO_SPLASHSCREEN": 1,
+      "HAVE_SHADER_CACHE": 1
+    },
+    "profileFlags": {
+      "HAVE_PROFILING": 1,
+      "LOG_ERRORS": 1
+    },
+    "forbiddenFlags": [
+      "BUFFERS_SPEEDHACK",
+      "DRAW_SPEEDHACK",
+      "INDICES_DRAW_SPEEDHACK",
+      "INDICES_SPEEDHACK",
+      "TEXTURE_UPLOADS_SPEEDHACK",
+      "DEPTH_STENCIL_HACK",
+      "CIRCULAR_POOL_SPEEDHACK"
+    ]
+  }
+}

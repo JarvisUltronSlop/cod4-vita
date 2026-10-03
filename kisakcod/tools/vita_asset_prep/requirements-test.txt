@@ -1,0 +1,2 @@
+# Isolated host test environment; includes test functions outside __main__.
+pytest==9.1.1

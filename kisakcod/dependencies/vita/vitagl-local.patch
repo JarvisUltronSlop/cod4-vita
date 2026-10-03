@@ -1,0 +1,434 @@
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -49,6 +49,15 @@
+ // Newlib mempool usage setting
+ GLboolean use_extra_mem = GL_TRUE;
+ 
++// Immutable texture loaders generally know the complete chain up front.
++// Keep this as a one-shot main-thread hint so level zero can reserve its final
++// footprint instead of growing through a realloc for every following mip.
++static uint32_t compressed_texture_mipmap_count_hint = 1;
++
++void vglSetCompressedTextureMipmapCountHint(GLuint count) {
++	compressed_texture_mipmap_count_hint = count > 0 && count <= 16 ? count : 1;
++}
++
+ static inline __attribute__((always_inline)) uint64_t morton_1(uint64_t x) {
+ 	x = x & 0x5555555555555555;
+ 	x = (x | (x >> 1)) & 0x3333333333333333;
+@@ -89,7 +98,11 @@
+ }
+ 
+ static inline __attribute__((always_inline)) void *gpu_alloc_mapped_aligned_for_cpu_inner(size_t alignment, size_t size) {
+-	void *res;
++	// When external spill is disabled every bounded pool can legitimately be
++	// exhausted.  Returning an uninitialised stack value in that case turns a
++	// clean allocation failure into an arbitrary pointer that is later handed
++	// to newlib/realloc.  Keep the fail-closed result deterministic.
++	void *res = NULL;
+ 	vgl_alloc_attempt(alignment, size, VGL_MEM_RAM)
+ 	vgl_alloc_attempt(alignment, size, VGL_MEM_PHYCONT)
+ 	vgl_alloc_attempt(alignment, size, VGL_MEM_BUDGET)
+@@ -101,7 +114,7 @@
+ }
+ 
+ static inline __attribute__((always_inline)) void *gpu_alloc_mapped_aligned_for_gpu_inner(size_t alignment, size_t size) {
+-	void *res;
++	void *res = NULL;
+ 	vgl_alloc_attempt(alignment, size, VGL_MEM_VRAM)
+ 	vgl_alloc_attempt(alignment, size, VGL_MEM_RAM)
+ 	vgl_alloc_attempt(alignment, size, VGL_MEM_PHYCONT)
+@@ -626,19 +639,25 @@
+ 					}
+ 					break;
+ 				default:
+-					if (aligned_width == w && aligned_height == h && h <= 2048) {
+-#ifdef TEXTURE_UPLOADS_SPEEDHACK
+-						void *mapped_src = data;
+-#else
+-						void *mapped_src = gpu_alloc_mapped_temp(image_size);
+-						vgl_fast_memcpy(mapped_src, data, image_size);
+-#endif
+-						sceGxmTransferCopy(w / 4, h / 4, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
+-							SCE_GXM_TRANSFER_FORMAT_RAW64, SCE_GXM_TRANSFER_LINEAR, mapped_src, 0, 0, w * 2,
+-							SCE_GXM_TRANSFER_FORMAT_RAW64, SCE_GXM_TRANSFER_SWIZZLED, mip_data, 0, 0, w * 2, NULL, 0, NULL);
+-					} else {
+-						SwizzleTexData64Bpp((uint8_t *)mip_data, (uint8_t *)data, 0, 0, ALIGNBLOCK(w, 4), ALIGNBLOCK(h, 4), ALIGNBLOCK(w, 4), ALIGNBLOCK(MIN(aligned_width, aligned_height), 4));
+-					}
++					// Cube faces are submitted one at a time through the GL
++					// face-target API.  Keep their source-to-GXM conversion on
++					// the deterministic CPU swizzler instead of the transfer
++					// engine: Vita3K's transfer path can retain the temporary
++					// source range across the next face and corrupt the guest
++					// heap, while the CPU swizzle writes only this face's
++					// mapped destination.  The byte layout is identical to the
++					// transfer fast path and remains source-authored DXT data.
++					// The swizzler operates on compressed blocks, not source
++					// texels.  A 512x512 DXT1 face is therefore 128x128
++					// eight-byte elements; passing the texel dimensions would
++					// overrun both the source face and the mapped destination.
++					const uint32_t blockWidth = (w + 3u) / 4u;
++					const uint32_t blockHeight = (h + 3u) / 4u;
++					const uint32_t alignedBlockWidth = (aligned_width + 3u) / 4u;
++					const uint32_t alignedBlockHeight = (aligned_height + 3u) / 4u;
++					SwizzleTexData64Bpp((uint8_t *)mip_data, (uint8_t *)data, 0, 0,
++						blockWidth, blockHeight, blockWidth,
++						MIN(alignedBlockWidth, alignedBlockHeight));
+ 					break;
+ 				}
+ 			}
+@@ -689,32 +708,52 @@
+ 	const int mip_size = tex_size - mip_offset;
+ 
+ 	int mip_count, tex_width, tex_height;
++	uint32_t allocation_capacity = tex->compressed_capacity;
+ 	void *texture_data;
+ 	if (mip_level) {
+ 		mip_count = tex->mip_count - 1;
+ 		tex_width = max_width;
+ 		tex_height = max_height;
+ 
+-		if (mip_count >= mip_level)
++		// Do not ask the platform allocator for usable size. In particular,
++		// Vita3K does not implement the mspace usable-size query. Tracking
++		// our reservation also prevents shrinking a preallocated mip chain.
++		if (allocation_capacity >= (uint32_t)tex_size)
+ 			texture_data = tex->data;
+ 		else {
+ 			texture_data = vgl_realloc(tex->data, tex_size);
+ 			if (!texture_data) {
+ 				// Reallocation in the same mspace failed, try manually.
+ 				texture_data = gpu_alloc_mapped_for_gpu(tex_size);
+-				const int old_data_size = gpu_get_compressed_mipchain_size(mip_count, aligned_max_width, aligned_max_height, format);
+-				vgl_memcpy(texture_data, tex->data, old_data_size);
+-				gpu_free_texture_data(tex);
++				if (texture_data) {
++					const int old_data_size = gpu_get_compressed_mipchain_size(mip_count, aligned_max_width, aligned_max_height, format);
++					vgl_memcpy(texture_data, tex->data, old_data_size);
++					gpu_free_texture_data(tex);
++				}
+ 			}
+ 
+-			// Set new mip count.
+-			mip_count = mip_level;
++			if (texture_data) allocation_capacity = tex_size;
+ 		}
++		// A reserved chain can grow without reallocating. Expose every
++		// uploaded level to the sampler even when storage was already large
++		// enough; allocation size and initialized mip count are separate.
++		if (mip_count < mip_level) mip_count = mip_level;
+ 	} else {
+ 		mip_count = mip_level;
+ 		tex_width = w;
+ 		tex_height = h;
+-		texture_data = gpu_alloc_mapped_for_gpu(tex_size);
++		const uint32_t hinted_mip_count = compressed_texture_mipmap_count_hint;
++		compressed_texture_mipmap_count_hint = 1;
++		const int allocation_size = hinted_mip_count > 1
++			? gpu_get_compressed_mipchain_size(hinted_mip_count - 1,
++				aligned_max_width, aligned_max_height, format)
++			: tex_size;
++		texture_data = gpu_alloc_mapped_for_gpu(allocation_size);
++		allocation_capacity = allocation_size;
++	}
++	if (!texture_data) {
++		vgl_error = GL_OUT_OF_MEMORY;
++		return;
+ 	}
+ 
+ 	// Initializing texture data buffer
+@@ -736,21 +775,19 @@
+ 					break;
+ 				case SCE_GXM_TEXTURE_FORMAT_UBC2_ABGR:
+ 				case SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR:
+-				case SCE_GXM_TEXTURE_FORMAT_UBC5_GR:
+-					if (aligned_width == w && aligned_height == h && h <= 2048 && w <= 2048) {
+-#ifdef TEXTURE_UPLOADS_SPEEDHACK
+-						void *mapped_src = data;
+-#else
+-						void *mapped_src = gpu_alloc_mapped_temp(image_size);
+-						vgl_fast_memcpy(mapped_src, data, image_size);
+-#endif
+-						sceGxmTransferCopy(w / 4, h / 4, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
+-							SCE_GXM_TRANSFER_FORMAT_RAW128, SCE_GXM_TRANSFER_LINEAR, mapped_src, 0, 0, w * 4,
+-							SCE_GXM_TRANSFER_FORMAT_RAW128, SCE_GXM_TRANSFER_SWIZZLED, mip_data, 0, 0, w * 4, NULL, 0, NULL);
+-					} else {
+-						SwizzleTexData128Bpp((uint8_t *)mip_data, (uint8_t *)data, 0, 0, ALIGNBLOCK(w, 4), ALIGNBLOCK(h, 4), ALIGNBLOCK(w, 4), ALIGNBLOCK(MIN(aligned_width, aligned_height), 4));
+-					}
++				case SCE_GXM_TEXTURE_FORMAT_UBC5_GR: {
++					// As with UBC1 below, swizzle the already-compressed blocks on
++					// the CPU. This is load-time layout conversion only and avoids
++					// retaining transfer-engine source ranges across mip uploads.
++					const uint32_t blockWidth = (w + 3u) / 4u;
++					const uint32_t blockHeight = (h + 3u) / 4u;
++					const uint32_t alignedBlockWidth = (aligned_width + 3u) / 4u;
++					const uint32_t alignedBlockHeight = (aligned_height + 3u) / 4u;
++					SwizzleTexData128Bpp((uint8_t *)mip_data, (uint8_t *)data, 0, 0,
++						blockWidth, blockHeight, blockWidth,
++						MIN(alignedBlockWidth, alignedBlockHeight));
+ 					break;
++				}
+ 				case SCE_GXM_TEXTURE_FORMAT_ETC1_1BGR:
+ 					SwizzleTexDataETC1((uint8_t *)mip_data, (uint8_t *)data, 0, 0, ALIGNBLOCK(w, 4), ALIGNBLOCK(h, 4), ALIGNBLOCK(w, 4), ALIGNBLOCK(MIN(aligned_width, aligned_height), 4));
+ 					break;
+@@ -767,6 +804,23 @@
+ 							SCE_GXM_TRANSFER_FORMAT_RAW64, SCE_GXM_TRANSFER_SWIZZLED, mip_data, 0, 0, w, NULL, 0, NULL);
+ 					} else {
+ 						SwizzleTexData64Bpp((uint8_t *)mip_data, (uint8_t *)data, 0, 0, ALIGNBLOCK(w, 8), ALIGNBLOCK(h, 4), ALIGNBLOCK(w, 8), MIN(ALIGNBLOCK(aligned_width, 8), ALIGNBLOCK(aligned_height, 4)));
++					}
++					break;
++				case SCE_GXM_TEXTURE_FORMAT_UBC1_1BGR:
++				case SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR:
++					// Keep DXT1 on the same deterministic CPU block swizzle as
++					// cube faces.  Vita3K's RAW64 transfer path can retain its
++					// temporary source range across successive 2D mips and corrupt
++					// the guest heap; the CPU path writes only the mapped texture
++					// destination and preserves the authored compressed blocks.
++					{
++						const uint32_t blockWidth = (w + 3u) / 4u;
++						const uint32_t blockHeight = (h + 3u) / 4u;
++						const uint32_t alignedBlockWidth = (aligned_width + 3u) / 4u;
++						const uint32_t alignedBlockHeight = (aligned_height + 3u) / 4u;
++						SwizzleTexData64Bpp((uint8_t *)mip_data, (uint8_t *)data, 0, 0,
++							blockWidth, blockHeight, blockWidth,
++							MIN(alignedBlockWidth, alignedBlockHeight));
+ 					}
+ 					break;
+ 				default:
+@@ -792,6 +846,7 @@
+ 
+ 		// Initializing texture and validating it
+ 		tex->mip_count = mip_count + 1;
++		tex->compressed_capacity = allocation_capacity;
+ 		vglInitSwizzledTexture(&tex->gxm_tex, texture_data, format, tex_width, tex_height, tex->use_mips ? tex->mip_count : 0);
+ 		tex->palette_data = NULL;
+ 		tex->status = TEX_VALID;
+diff --git a/source/vgl.c b/source/vgl.c
+index 699e2a4..38a769a 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -840,5 +840,13 @@ void vglSetShaderCachePath(const char *path) {
+ }
+ 
+ void vglSetShaderAssociationPath(const char *path) {
++	// vitaShaRK versions shipped by the VitaSDK do not expose the optional
++	// shader-association hook.  The public vitaGL entry point is still useful
++	// to callers that build with a newer shark, but keep the stock SDK library
++	// linkable when shader-cache support is not compiled in.
++#ifdef HAVE_SHADER_CACHE
+ 	shark_set_shader_association_path(path);
++#else
++	(void)path;
++#endif
+ }
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index b7de2d4..20b0302 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1255,6 +1255,11 @@ void vglSetShaderCachePath(const char *path);
+ // Change the lifetime for a texture to be considered cacheable. Requires HAVE_TEXTURE_CACHE.
+ void vglSetTextureCacheFrequency(GLuint freq);
+ 
++// Reserve the storage for the next compressed 2D texture's complete mip
++// chain before level zero is uploaded. This avoids transient realloc peaks
++// when an application already knows the immutable chain length.
++void vglSetCompressedTextureMipmapCountHint(GLuint count);
++
+ // Setup the fragment USSE ring buffer size of sceGxm. Must be called before vglInit*. Default value: SCE_GXM_DEFAULT_FRAGMENT_USSE_RING_BUFFER_SIZE.
+ void vglSetUSSEBufferSize(uint32_t size);
+ 
+diff --git a/source/utils/mem_utils.c b/source/utils/mem_utils.c
+--- a/source/utils/mem_utils.c
++++ b/source/utils/mem_utils.c
+@@ -506,12 +506,12 @@
+ 	// Getting total available phycont mem
+ 	uint32_t phycont_size;
+ 	if (system_app_mode) {
+-		SceAppMgrBudgetInfo info;
++		SceAppMgrBudgetInfo info = {};
+ 		info.size = sizeof(SceAppMgrBudgetInfo);
+ 		sceAppMgrGetBudgetInfo(&info);
+ 		phycont_size = info.total_phycont_mem;
+ 	} else {
+-		SceKernelFreeMemorySizeInfo info;
++		SceKernelFreeMemorySizeInfo info = {};
+ 		info.size = sizeof(SceKernelFreeMemorySizeInfo);
+ 		sceKernelGetFreeMemorySize(&info);
+ 		phycont_size = info.size_phycont;
+@@ -602,14 +602,14 @@
+ #ifdef PHYCONT_ON_DEMAND
+ 	} else if (type == VGL_MEM_PHYCONT) {
+ 		if (system_app_mode) {
+-			SceAppMgrBudgetInfo info;
++			SceAppMgrBudgetInfo info = {};
+ 			info.size = sizeof(SceAppMgrBudgetInfo);
+-			sceAppMgrGetBudgetInfo(&info);
++			if (sceAppMgrGetBudgetInfo(&info) < 0) return 0;
+ 			return info.free_phycont_mem;
+ 		} else {
+-			SceKernelFreeMemorySizeInfo info;
++			SceKernelFreeMemorySizeInfo info = {};
+ 			info.size = sizeof(SceKernelFreeMemorySizeInfo);
+-			sceKernelGetFreeMemorySize(&info);
++			if (sceKernelGetFreeMemorySize(&info) < 0) return 0;
+ 			return info.size_phycont;
+ 		}
+ #endif
+@@ -625,8 +625,12 @@
+ 	}
+ #else
+ 	} else if (mempool_size[type]) {
+-		SceClibMspaceStats stats;
++		SceClibMspaceStats stats = {};
+ 		sceClibMspaceMallocStats(mempool_mspace[type], &stats);
++		// Some emulators leave the output untouched. Never subtract garbage
++		// or claim an impossible amount of available memory. Zero is the
++		// conservative allocator result; callers must not use it to certify residency.
++		if (stats.capacity > mempool_size[type] || stats.current_in_use > stats.capacity) return 0;
+ 		return stats.capacity - stats.current_in_use;
+ 	} else
+ 		return 0;
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -200,6 +200,8 @@
+ #endif
+ 	uint8_t status;
+ 	uint8_t mip_count;
++	// Storage capacity is independent of the initialized mip count.
++	uint32_t compressed_capacity;
+ 	uint8_t ref_counter;
+ 	uint8_t faces_counter;
+ 	GLboolean use_mips;
+diff --git a/source/textures.c b/source/textures.c
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1742,6 +1742,9 @@
+ 			texture_slots[i].faces_counter = 0;
+ 			texture_slots[i].ref_counter = 0;
+ 			texture_slots[i].mip_count = 1;
++			texture_slots[i].compressed_capacity = 0;
++			texture_slots[i].data = NULL;
++			texture_slots[i].palette_data = NULL;
+ #ifdef HAVE_UNPURE_TEXTURES
+ 			texture_slots[i].mip_start = -1;
+ #endif
+diff --git a/source/utils/gpu_utils.h b/source/utils/gpu_utils.h
+--- a/source/utils/gpu_utils.h
++++ b/source/utils/gpu_utils.h
+@@ -152,6 +152,7 @@
+ 
+ // Dealloc a texture data
+ static inline __attribute__((always_inline)) void gpu_free_texture_data(texture *tex) {
++	tex->compressed_capacity = 0;
+ 	// Deallocating texture
+ 	if (tex->data != NULL) {
+ #ifdef HAVE_TEX_CACHE
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -265,6 +265,13 @@
+ }
+ 
+ // Garbage collector
++// COD4 opt-in wall-clock split; synchronization semantics are unchanged.
++static GLboolean cod4_timing_enabled = GL_FALSE;
++static uint32_t cod4_swap[8];
++static uint32_t cod4_gc_us, cod4_gc_frees, cod4_gc_targets;
++void vglCod4TimingEnable(GLboolean enabled) { cod4_timing_enabled = enabled; }
++void vglCod4TimingRead(uint32_t *out) { memcpy(out, cod4_swap, sizeof(cod4_swap)); }
++void vglCod4ConfigRead(uint32_t *out) { out[0]=system_app_mode; out[1]=msaa_mode; out[2]=gxm_display_buffer_count; }
+ #if defined(HAVE_PTHREAD) && !defined(HAVE_SINGLE_THREADED_GC)
+ void garbage_collector(void *arg) {
+ #else
+@@ -276,9 +283,12 @@
+ 		sceKernelWaitSema(gc_mutex[0], 1, NULL);
+ #endif
+ 		// Purging all elements marked for deletion
++        const uint64_t cod4_gc_start = cod4_timing_enabled ? sceKernelGetProcessTimeWide() : 0;
++        uint32_t cod4_frees = 0, cod4_targets = 0;
+ 		for (int i = 0; i < FRAME_PURGE_LIST_SIZE; i++) {
+ 			if (frame_purge_list[frame_purge_clean_idx][i]) {
+ 				vgl_free(frame_purge_list[frame_purge_clean_idx][i]);
++                ++cod4_frees;
+ 				frame_purge_list[frame_purge_clean_idx][i] = NULL;
+ 			} else
+ 				break;
+@@ -286,6 +296,7 @@
+ 		for (int i = 0; i < FRAME_PURGE_RENDERTARGETS_LIST_SIZE; i++) {
+ 			if (frame_rt_purge_list[frame_purge_clean_idx][i]) {
+ 				sceGxmDestroyRenderTarget(frame_rt_purge_list[frame_purge_clean_idx][i]);
++                ++cod4_targets;
+ 				frame_rt_purge_list[frame_purge_clean_idx][i] = NULL;
+ 			} else
+ 				break;
+@@ -295,7 +306,11 @@
+ 		frame_elem_purge_idx = 0;
+ 		frame_rt_purge_idx = 0;
+ #ifndef HAVE_SINGLE_THREADED_GC
+-		sceKernelSignalSema(gc_mutex[1], 1);
++		if (cod4_timing_enabled) {
++            cod4_gc_us = (uint32_t)(sceKernelGetProcessTimeWide() - cod4_gc_start);
++            cod4_gc_frees = cod4_frees; cod4_gc_targets = cod4_targets;
++        }
++        sceKernelSignalSema(gc_mutex[1], 1);
+ 	}
+ #ifndef HAVE_PTHREAD
+ 	return sceKernelExitDeleteThread(0);
+@@ -742,6 +757,9 @@
+ }
+ 
+ void vglSwapBuffers(GLboolean has_commondialog) {
++    uint64_t cod4_start = cod4_timing_enabled ? sceKernelGetProcessTimeWide() : 0;
++    uint64_t cod4_phase = cod4_start;
++    memset(cod4_swap, 0, sizeof(cod4_swap));
+ 	THREAD_SAFE()
+ 
+ #ifndef SKIP_SPLASHSCREEN
+@@ -798,8 +816,9 @@
+ 	dirty_shader_vert_unifs = GL_TRUE;
+ 	needs_end_scene = GL_FALSE;
+ 
+-	if (!needs_scene_reset)
+-		scene_end();
++	if (cod4_timing_enabled) cod4_phase = sceKernelGetProcessTimeWide();
++    if (!needs_scene_reset) scene_end();
++    if (cod4_timing_enabled) cod4_swap[0] = (uint32_t)(sceKernelGetProcessTimeWide() - cod4_phase);
+ 
+ 	if (vgl_has_cdlg_support && has_commondialog) {
+ 		// Performing commondialog update
+@@ -917,7 +936,9 @@
+ #ifdef HAVE_PROFILING
+ 		tick = sceKernelGetProcessTimeLow();
+ #endif
+-		sceGxmDisplayQueueAddEntry(gxm_sync_objects[gxm_front_buffer_index], gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++		if (cod4_timing_enabled) cod4_phase = sceKernelGetProcessTimeWide();
++        sceGxmDisplayQueueAddEntry(gxm_sync_objects[gxm_front_buffer_index], gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++        if (cod4_timing_enabled) cod4_swap[1] = (uint32_t)(sceKernelGetProcessTimeWide() - cod4_phase);
+ #ifdef HAVE_PROFILING
+ 		gpu_stall_cnt += sceKernelGetProcessTimeLow() - tick;
+ #endif
+@@ -953,9 +974,21 @@
+ #ifdef HAVE_SINGLE_THREADED_GC
+ 	garbage_collector(0, NULL);
+ #else
+-	sceKernelWaitSema(gc_mutex[1], 1, NULL);
++	if (cod4_timing_enabled) cod4_phase = sceKernelGetProcessTimeWide();
++    sceKernelWaitSema(gc_mutex[1], 1, NULL);
++    // Read the completed job BEFORE signalling another. The semaphore gives
++    // a happens-before boundary and avoids reading a concurrently written job.
++    if (cod4_timing_enabled) {
++        cod4_swap[2] = (uint32_t)(sceKernelGetProcessTimeWide() - cod4_phase);
++        cod4_swap[3] = cod4_gc_us; cod4_swap[4] = cod4_gc_frees; cod4_swap[5] = cod4_gc_targets;
++    }
+ 	sceKernelSignalSema(gc_mutex[0], 1);
+ #endif
++    if (cod4_timing_enabled) {
++        cod4_swap[6] = (uint32_t)(sceKernelGetProcessTimeWide() - cod4_start);
++        uint32_t known = cod4_swap[0] + cod4_swap[1] + cod4_swap[2];
++        cod4_swap[7] = cod4_swap[6] > known ? cod4_swap[6] - known : 0;
++    }
+ }
+ 
+ void glFinish(void) {

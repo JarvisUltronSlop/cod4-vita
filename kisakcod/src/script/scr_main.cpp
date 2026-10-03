@@ -1,0 +1,439 @@
+#include <universal/q_shared.h>
+#include "scr_main.h"
+#if defined(KISAK_VITA_SLICE)
+#include <vita/vita_script_services.h>
+#include <psp2/kernel/clib.h>
+#include <cstdio>
+#endif
+#include "scr_stringlist.h"
+
+#include <universal/assertive.h>
+#include "scr_compiler.h"
+#include <win32/win_net_debug.h>
+#include "scr_vm.h"
+#include <universal/profile.h>
+#include "scr_evaluate.h"
+#include "scr_animtree.h"
+#include "scr_parsetree.h"
+#include "scr_yacc.h"
+
+#undef GetObject
+
+bool Scr_IsInOpcodeMemory(char const* pos)
+{
+    iassert(scrVarPub.programBuffer);
+    iassert(pos);
+    return pos - scrVarPub.programBuffer < scrCompilePub.programLen;
+}
+
+bool Scr_IsIdentifier(char const* token)
+{
+    while (*token)
+    {
+        if (!I_iscsym(*token))
+            return 0;
+        ++token;
+    }
+    return 1;
+}
+
+uint32_t SL_TransferToCanonicalString(uint32_t stringValue)
+{
+	iassert(stringValue);
+	SL_TransferRefToUser(stringValue, 2u);
+
+	if (scrCompilePub.canonicalStrings[stringValue])
+		return scrCompilePub.canonicalStrings[stringValue];
+
+	scrCompilePub.canonicalStrings[stringValue] = ++scrVarPub.canonicalStrCount;
+
+	return scrVarPub.canonicalStrCount;
+}
+
+uint32_t __cdecl SL_GetCanonicalString(const char* str)
+{
+    uint32_t v1; // eax
+    uint32_t v3; // eax
+
+    v1 = SL_FindString(str);
+    if (scrCompilePub.canonicalStrings[v1])
+        return scrCompilePub.canonicalStrings[v1];
+    v3 = SL_GetString_(str, 0, MT_TYPE_CLASS);
+    return SL_TransferToCanonicalString(v3);
+}
+
+void SL_BeginLoadScripts()
+{
+    memset((uint8_t*)scrCompilePub.canonicalStrings, 0, sizeof(scrCompilePub.canonicalStrings));
+    scrVarPub.canonicalStrCount = 0;
+}
+
+int __cdecl Scr_ScanFile(unsigned char *buf, int max_size)
+{
+    char c; // [esp+3h] [ebp-5h]
+    int n; // [esp+4h] [ebp-4h]
+#if defined(KISAK_VITA_SLICE)
+    static uint32_t vitaScanCount = 0;
+    const uint32_t scanIndex = ++vitaScanCount;
+    if (scanIndex <= 8u)
+    {
+        sceClibPrintf("[kisak-vita] script scan begin index=%u max=%d in=%p parse=%p\n",
+                      static_cast<unsigned>(scanIndex), max_size,
+                      static_cast<const void*>(scrCompilePub.in_ptr),
+                      static_cast<const void*>(scrCompilePub.parseBuf));
+    }
+#endif
+
+    c = 42;
+    for (n = 0; n < max_size; ++n)
+    {
+        c = *scrCompilePub.in_ptr++;
+        if (!c || c == 10)
+            break;
+        buf[n] = c;
+    }
+    if (c == 10)
+    {
+        buf[n++] = c;
+    }
+    else if (!c)
+    {
+        if (scrCompilePub.parseBuf)
+        {
+            scrCompilePub.in_ptr = scrCompilePub.parseBuf;
+            scrCompilePub.parseBuf = 0;
+        }
+        else
+        {
+            --scrCompilePub.in_ptr;
+        }
+    }
+#if defined(KISAK_VITA_SLICE)
+    if (scanIndex <= 8u)
+    {
+        sceClibPrintf("[kisak-vita] script scan end index=%u bytes=%d first=%02x,%02x,%02x,%02x in=%p parse=%p\n",
+                      static_cast<unsigned>(scanIndex), n,
+                      n > 0 ? static_cast<unsigned>(buf[0]) : 0u,
+                      n > 1 ? static_cast<unsigned>(buf[1]) : 0u,
+                      n > 2 ? static_cast<unsigned>(buf[2]) : 0u,
+                      n > 3 ? static_cast<unsigned>(buf[3]) : 0u,
+                      static_cast<const void*>(scrCompilePub.in_ptr),
+                      static_cast<const void*>(scrCompilePub.parseBuf));
+    }
+#endif
+    return n;
+}
+
+void __cdecl Scr_SetLoadedImpureScript(bool loadedImpureScript)
+{
+    g_loadedImpureScript = loadedImpureScript;
+}
+
+void __cdecl Scr_BeginLoadScripts()
+{
+    scrVarPub.varUsagePos = "<script compile variable>";
+    if (scrCompilePub.script_loading)
+        MyAssertHandler(".\\script\\scr_main.cpp", 156, 0, "%s", "!scrCompilePub.script_loading");
+    scrCompilePub.script_loading = 1;
+    Scr_InitOpcodeLookup();
+    Scr_InitDebuggerMain();
+    if (scrCompilePub.loadedscripts)
+        MyAssertHandler(".\\script\\scr_main.cpp", 164, 0, "%s", "!scrCompilePub.loadedscripts");
+    scrCompilePub.loadedscripts = Scr_AllocArray();
+    if (scrVarDebugPub)
+        ++scrVarDebugPub->extRefCount[scrCompilePub.loadedscripts];
+    if (!Sys_IsRemoteDebugClient())
+    {
+        memset(profileScript.profileScriptNames, 0, sizeof(profileScript.profileScriptNames));
+        scrVmPub.showError = scrVarPub.developer;
+        if (scrCompilePub.scripts)
+            MyAssertHandler(".\\script\\scr_main.cpp", 184, 0, "%s", "!scrCompilePub.scripts");
+        scrCompilePub.scripts = Scr_AllocArray();
+        if (scrVarDebugPub)
+            ++scrVarDebugPub->extRefCount[scrCompilePub.scripts];
+        if (scrCompilePub.builtinFunc)
+            MyAssertHandler(".\\script\\scr_main.cpp", 191, 0, "%s", "!scrCompilePub.builtinFunc");
+        scrCompilePub.builtinFunc = Scr_AllocArray();
+        if (scrVarDebugPub)
+            ++scrVarDebugPub->extRefCount[scrCompilePub.builtinFunc];
+        if (scrCompilePub.builtinMeth)
+            MyAssertHandler(".\\script\\scr_main.cpp", 198, 0, "%s", "!scrCompilePub.builtinMeth");
+        scrCompilePub.builtinMeth = Scr_AllocArray();
+        if (scrVarDebugPub)
+            ++scrVarDebugPub->extRefCount[scrCompilePub.builtinMeth];
+        scrVarPub.programHunkUser = Hunk_UserCreate(0x100000, "Scr_BeginLoadScripts", 1, 0, 7);
+        TempMemoryReset(scrVarPub.programHunkUser);
+        scrVarPub.programBuffer = TempMalloc(0);
+        if (((int)scrVarPub.programBuffer & 0x1F) != 0)
+            MyAssertHandler(
+                ".\\script\\scr_main.cpp",
+                209,
+                0,
+                "%s\n\t((int)scrVarPub.programBuffer) = %i",
+                "(!((int)scrVarPub.programBuffer & 31))",
+                scrVarPub.programBuffer);
+        scrCompilePub.programLen = 0;
+        scrVarPub.endScriptBuffer = 0;
+        SL_BeginLoadScripts();
+        Scr_InitEvaluate();
+        scrVarPub.fieldBuffer = 0;
+        scrCompilePub.value_count = 0;
+        Scr_ClearErrorMessage();
+        scrCompilePub.func_table_size = 0;
+        scrAnimPub.animTreeNames = 0;
+        Scr_SetLoadedImpureScript(0);
+        Scr_BeginLoadAnimTrees(1);
+    }
+}
+
+void __cdecl Scr_EndLoadScripts()
+{
+    if (!Sys_IsRemoteDebugClient())
+    {
+        Scr_EndLoadEvaluate();
+        KISAK_NULLSUB();
+        SL_ShutdownSystem(2);
+    }
+    Scr_InitDebugger();
+    scrCompilePub.script_loading = 0;
+    if (!scrCompilePub.loadedscripts)
+        MyAssertHandler(".\\script\\scr_main.cpp", 415, 0, "%s", "scrCompilePub.loadedscripts");
+    ClearObject(scrCompilePub.loadedscripts);
+    if (scrVarDebugPub)
+        --scrVarDebugPub->extRefCount[scrCompilePub.loadedscripts];
+    RemoveRefToObject(scrCompilePub.loadedscripts);
+    scrCompilePub.loadedscripts = 0;
+    if (!Sys_IsRemoteDebugClient())
+    {
+        if (!scrCompilePub.scripts)
+            MyAssertHandler(".\\script\\scr_main.cpp", 429, 0, "%s", "scrCompilePub.scripts");
+        ClearObject(scrCompilePub.scripts);
+        if (scrVarDebugPub)
+            --scrVarDebugPub->extRefCount[scrCompilePub.scripts];
+        RemoveRefToObject(scrCompilePub.scripts);
+        scrCompilePub.scripts = 0;
+        if (!scrCompilePub.builtinFunc)
+            MyAssertHandler(".\\script\\scr_main.cpp", 438, 0, "%s", "scrCompilePub.builtinFunc");
+        ClearObject(scrCompilePub.builtinFunc);
+        if (scrVarDebugPub)
+            --scrVarDebugPub->extRefCount[scrCompilePub.builtinFunc];
+        RemoveRefToObject(scrCompilePub.builtinFunc);
+        scrCompilePub.builtinFunc = 0;
+        if (!scrCompilePub.builtinMeth)
+            MyAssertHandler(".\\script\\scr_main.cpp", 447, 0, "%s", "scrCompilePub.builtinMeth");
+        ClearObject(scrCompilePub.builtinMeth);
+        if (scrVarDebugPub)
+            --scrVarDebugPub->extRefCount[scrCompilePub.builtinMeth];
+        RemoveRefToObject(scrCompilePub.builtinMeth);
+        scrCompilePub.builtinMeth = 0;
+    }
+}
+
+void __cdecl Scr_BeginLoadAnimTrees(int user)
+{
+    scrVarPub.varUsagePos = "<script compile variable>";
+    iassert(!scrAnimPub.animtree_loading);
+    scrAnimPub.animtree_loading = 1;
+    scrAnimPub.xanim_num[user] = 0;
+    scrAnimPub.xanim_lookup[user][0].anims = 0;
+    iassert(!scrAnimPub.animtrees);
+    scrAnimPub.animtrees = Scr_AllocArray();
+    if (scrVarDebugPub)
+        ++scrVarDebugPub->extRefCount[scrAnimPub.animtrees];
+    scrAnimPub.animtree_node = 0;
+    scrCompilePub.developer_statement = 0;
+}
+
+uint32_t __cdecl Scr_LoadScriptInternal(const char *filename, PrecacheEntry *entries, int entriesCount)
+{
+    uint32_t Variable; // eax
+    VariableValueInternal_u Object; // [esp+0h] [ebp-7Ch]
+    char extFilename[64]; // [esp+14h] [ebp-68h] BYREF
+    uint32_t filePtr; // [esp+58h] [ebp-24h]
+    char *sourceBuffer; // [esp+5Ch] [ebp-20h]
+    const char *oldFilename; // [esp+60h] [ebp-1Ch]
+    uint32_t name; // [esp+64h] [ebp-18h]
+    uint32_t oldAnimTreeNames; // [esp+68h] [ebp-14h]
+    const char *oldSourceBuf; // [esp+6Ch] [ebp-10h]
+    uint32_t scriptId; // [esp+70h] [ebp-Ch]
+    sval_u parseData; // [esp+74h] [ebp-8h] BYREF
+    uint32_t fileId; // [esp+78h] [ebp-4h]
+
+    iassert(scrCompilePub.script_loading);
+    iassert(strlen(filename) < MAX_QPATH);
+
+    Hunk_CheckTempMemoryHighClear();
+#if defined(KISAK_VITA_SLICE)
+    sceClibPrintf("[kisak-vita] script load enter file=%s scripts=%u loaded=%u\n",
+                  filename ? filename : "<null>",
+                  static_cast<unsigned>(scrCompilePub.scripts),
+                  static_cast<unsigned>(scrCompilePub.loadedscripts));
+    kisak::vita::VitaScriptServicesTrace("script_source_begin", filename);
+#endif
+
+    name = Scr_CreateCanonicalFilename(filename);
+
+#if defined(KISAK_VITA_SLICE)
+    sceClibPrintf("[kisak-vita] script canonical file=%s name=%u cached=%u\n",
+                  filename ? filename : "<null>", static_cast<unsigned>(name),
+                  static_cast<unsigned>(FindVariable(
+                      scrCompilePub.loadedscripts, name)));
+#endif
+
+    if (FindVariable(scrCompilePub.loadedscripts, name))
+    {
+        SL_RemoveRefToString(name);
+        filePtr = FindVariable(scrCompilePub.scripts, name);
+
+        if (!filePtr)
+            return 0;
+
+        return FindObject(filePtr);
+    }
+    else
+    {
+        scriptId = GetNewVariable(scrCompilePub.loadedscripts, name);
+        SL_RemoveRefToString(name);
+        Com_sprintf(extFilename, 64, "%s.gsc", SL_ConvertToString(name));
+#if defined(KISAK_VITA_SLICE)
+        sceClibPrintf("[kisak-vita] script source request file=%s name=%u scriptId=%u\n",
+                      extFilename, static_cast<unsigned>(name),
+                      static_cast<unsigned>(scriptId));
+#endif
+        oldSourceBuf = scrParserPub.sourceBuf;
+        ProfLoad_Begin("Scr_AddSourceBuffer");
+        sourceBuffer = Scr_AddSourceBuffer(SL_ConvertToString(name), extFilename, TempMalloc(0), 1);
+        ProfLoad_End();
+#if defined(KISAK_VITA_SLICE)
+        sceClibPrintf("[kisak-vita] script source result file=%s ptr=%p scriptId=%u\n",
+                      extFilename, static_cast<void*>(sourceBuffer),
+                      static_cast<unsigned>(scriptId));
+#endif
+        if (sourceBuffer)
+        {
+            oldAnimTreeNames = scrAnimPub.animTreeNames;
+            scrAnimPub.animTreeNames = 0;
+            scrCompilePub.far_function_count = 0;
+            Scr_InitAllocNode();
+            oldFilename = scrParserPub.scriptfilename;
+            scrParserPub.scriptfilename = extFilename;
+            scrCompilePub.in_ptr = "+";
+            scrCompilePub.parseBuf = sourceBuffer;
+#if defined(KISAK_VITA_SLICE)
+            kisak::vita::VitaScriptServicesTrace("script_parse_begin", extFilename);
+            sceClibPrintf("[kisak-vita] script parse begin file=%s ptr=%p\n",
+                          extFilename, static_cast<void*>(sourceBuffer));
+#endif
+            ScriptParse(&parseData, 0);
+#if defined(KISAK_VITA_SLICE)
+            sceClibPrintf("[kisak-vita] script parse end file=%s node=%p error=%u\n",
+                          extFilename, parseData.node,
+                          kisak::vita::VitaScriptServicesHadError() ? 1u : 0u);
+            kisak::vita::VitaScriptServicesTrace("script_parse_end", extFilename,
+                                     kisak::vita::VitaScriptServicesHadError()
+                                         ? kisak::vita::VitaScriptServicesLastError() : nullptr);
+#endif
+            Variable = GetVariable(scrCompilePub.scripts, name);
+            fileId = GetObject(Variable);
+            ProfLoad_Begin("ScriptCompile");
+#if defined(KISAK_VITA_SLICE)
+            kisak::vita::VitaScriptServicesTrace("script_compile_begin", extFilename);
+#endif
+            ScriptCompile(parseData, fileId, scriptId, entries, entriesCount);
+#if defined(KISAK_VITA_SLICE)
+            sceClibPrintf("[kisak-vita] script compiled file=%s fileId=%u programLen=%u error=%u\n",
+                          extFilename, static_cast<unsigned>(fileId),
+                          static_cast<unsigned>(scrCompilePub.programLen),
+                          kisak::vita::VitaScriptServicesHadError() ? 1u : 0u);
+#endif
+#if defined(KISAK_VITA_SLICE)
+            kisak::vita::VitaScriptServicesTrace("script_compile_end", extFilename,
+                                     kisak::vita::VitaScriptServicesHadError()
+                                         ? kisak::vita::VitaScriptServicesLastError() : nullptr);
+#endif
+            ProfLoad_End();
+            scrParserPub.scriptfilename = oldFilename;
+            scrParserPub.sourceBuf = oldSourceBuf;
+            scrAnimPub.animTreeNames = oldAnimTreeNames;
+            Hunk_CheckTempMemoryHighClear();
+            return fileId;
+        }
+        else
+        {
+#if defined(KISAK_VITA_SLICE)
+            kisak::vita::VitaScriptServicesTrace("script_source_missing", extFilename);
+#endif
+            return 0;
+        }
+    }
+}
+
+uint32_t __cdecl Scr_LoadScript(const char *filename)
+{
+    PrecacheEntry entries[MAX_PRECACHE_ENTRIES]; // [esp+0h] [ebp-2000h] BYREF
+
+    return Scr_LoadScriptInternal(filename, &entries[0], 0);
+}
+
+void __cdecl Scr_PostCompileScripts()
+{
+    iassert(scrCompilePub.programLen == static_cast<uint>(TempMalloc(0) - scrVarPub.programBuffer));
+    iassert(!scrAnimPub.animTreeNames);
+}
+
+void __cdecl Scr_PrecacheAnimTrees(void *(__cdecl *Alloc)(int), int user)
+{
+    uint32_t i; // [esp+0h] [ebp-4h]
+
+    for (i = 1; i <= scrAnimPub.xanim_num[user]; ++i)
+        Scr_LoadAnimTreeAtIndex(i, Alloc, user);
+}
+
+void __cdecl Scr_EndLoadAnimTrees()
+{
+    iassert(scrAnimPub.animtrees);
+    ClearObject(scrAnimPub.animtrees);
+    if (scrVarDebugPub)
+        --scrVarDebugPub->extRefCount[scrAnimPub.animtrees];
+    RemoveRefToObject(scrAnimPub.animtrees);
+    scrAnimPub.animtrees = 0;
+    if (scrAnimPub.animtree_node)
+        RemoveRefToObject(scrAnimPub.animtree_node);
+    SL_ShutdownSystem(2);
+    if (scrVarPub.programBuffer && !scrVarPub.endScriptBuffer)
+        scrVarPub.endScriptBuffer = TempMalloc(0);
+    scrAnimPub.animtree_loading = 0;
+    scrVarPub.varUsagePos = 0;
+}
+
+void __cdecl Scr_FreeScripts(uint8_t sys)
+{
+    if (sys != 1)
+        MyAssertHandler(".\\script\\scr_main.cpp", 498, 0, "%s", "sys == SCR_SYS_GAME");
+    Hunk_CheckTempMemoryClear();
+    if (scrCompilePub.script_loading)
+    {
+        scrCompilePub.script_loading = 0;
+        Scr_EndLoadScripts();
+    }
+    if (scrAnimPub.animtree_loading)
+    {
+        scrAnimPub.animtree_loading = 0;
+        Scr_EndLoadAnimTrees();
+    }
+    Scr_ShutdownDebugger();
+    Scr_ShutdownDebuggerMain();
+    Scr_ShutdownEvaluate();
+    SL_ShutdownSystem(1);
+    Scr_ShutdownOpcodeLookup();
+    if (scrVarPub.programHunkUser)
+    {
+        Hunk_UserDestroy(scrVarPub.programHunkUser);
+        scrVarPub.programHunkUser = 0;
+    }
+    scrVarPub.programBuffer = 0;
+    scrCompilePub.programLen = 0;
+    scrVarPub.endScriptBuffer = 0;
+    scrVarPub.checksum = 0;
+}
+

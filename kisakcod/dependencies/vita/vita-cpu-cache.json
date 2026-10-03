@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "baseRevision": "3d035da150549cb38a83811f75856a121754cd5d",
+  "basePatchSha256": "67c491a7c023fb5b40ac2febdc8b6d66ea30d25fba43abafdd2cf6a68f5b73a1",
+  "patch": "vitagl-cpu-cache.patch",
+  "patchSha256": "215338603d53d415b589eb33fb460815a10922b1c0868c4ab3dab631bb60b8a5",
+  "cacheFormat": 1
+}

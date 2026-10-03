@@ -1,0 +1,121 @@
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1197,6 +1197,7 @@
+ extern GLfloat point_size; // Size of points for fixed function pipeline
+ 
+ /* gxm.c */
++extern int vgl_initialization_error;
+ void init_gxm(void); // Inits sceGxm
+ void init_gxm_context(SceGxmContext **ctx, uint8_t ctx_slot); // Inits sceGxm context
+ void create_display_render_target(void); // Creates render target for the display
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -93,6 +93,8 @@
+ float DISPLAY_HEIGHT_FLOAT; // Display height in pixels (float)
+ 
+ GLboolean system_app_mode = GL_FALSE; // Flag for system app mode usage
++int vgl_initialization_error = 0;
++int vglGetInitializationError(void) { return vgl_initialization_error; }
+ static GLboolean gxm_initialized = GL_FALSE; // Current sceGxm state
+ GLboolean is_rendering_display = GL_TRUE; // Flag for when drawing without fbo is being performed
+ 
+@@ -399,7 +401,8 @@
+ 	gxm_init_params.parameterBufferSize = gxm_param_buf_size;
+ 
+ 	// Initializing sceGxm
+-	sceGxmVshInitialize(&gxm_init_params);
++	vgl_initialization_error = sceGxmVshInitialize(&gxm_init_params);
++	if (vgl_initialization_error < 0) return;
+ 	gxm_initialized = GL_TRUE;
+ 
+ #ifdef HAVE_DEVKIT
+@@ -419,7 +422,7 @@
+ 	fragment_ring_buffer_addr[ctx_slot] = gpu_alloc_mapped_aligned_for_gpu(4096, gxm_fragment_buf_size);
+ 
+ 	// Allocating fragment USSE ring buffer
+-	unsigned int fragment_usse_offset;
++	unsigned int fragment_usse_offset = 0;
+ 	fragment_usse_ring_buffer_addr[ctx_slot] = gpu_fragment_usse_alloc_mapped(gxm_usse_buf_size, &fragment_usse_offset);
+ 
+ 	// Setting sceGxm context parameters
+@@ -437,8 +440,14 @@
+ 	gxm_context_params.fragmentUsseRingBufferMemSize = gxm_usse_buf_size;
+ 	gxm_context_params.fragmentUsseRingBufferOffset = fragment_usse_offset;
+ 
+-	// Initializing sceGxm context
+-	sceGxmCreateContext(&gxm_context_params, ctx);
++	// Startup cannot submit or collect GPU work until a context exists.
++	if (!gxm_context_params.hostMem || !vdm_ring_buffer_addr[ctx_slot] ||
++	    !vertex_ring_buffer_addr[ctx_slot] || !fragment_ring_buffer_addr[ctx_slot] ||
++	    !fragment_usse_ring_buffer_addr[ctx_slot]) {
++		vgl_initialization_error = -1; return;
++	}
++	vgl_initialization_error = sceGxmCreateContext(&gxm_context_params, ctx);
++	if (vgl_initialization_error < 0 || !*ctx) return;
+ #ifdef DISABLE_W_CLAMPING
+ 	sceGxmSetWClampEnable(**ctx, SCE_GXM_WCLAMP_MODE_DISABLED);
+ #endif
+--- a/source/utils/mem_utils.c
++++ b/source/utils/mem_utils.c
+@@ -486,13 +486,23 @@
+ 		}
+ 	}
+ 	for (int i = 0; i < VGL_MEM_EXTERNAL; i++) {
++		if (mempool_size[i] && mempool_id[i] < 0) {
++			vgl_initialization_error = mempool_id[i]; return;
++		}
++	}
++	for (int i = 0; i < VGL_MEM_EXTERNAL; i++) {
+ 		if (mempool_size[i]) {
+ 			mempool_addr[i] = NULL;
+-			sceKernelGetMemBlockBase(mempool_id[i], &mempool_addr[i]);
++			vgl_initialization_error = sceKernelGetMemBlockBase(mempool_id[i], &mempool_addr[i]);
++			if (vgl_initialization_error < 0 || !mempool_addr[i]) {
++				if (!vgl_initialization_error) vgl_initialization_error = -1;
++				return;
++			}
+ 
+ 			if (mempool_addr[i]) {
+ 				mempool_end[i] = (void *)((uintptr_t)mempool_addr[i] + mempool_size[i]);
+-				sceGxmMapMemory(mempool_addr[i], mempool_size[i], SCE_GXM_MEMORY_ATTRIB_RW);
++				vgl_initialization_error = sceGxmMapMemory(mempool_addr[i], mempool_size[i], SCE_GXM_MEMORY_ATTRIB_RW);
++				if (vgl_initialization_error < 0) return;
+ #ifndef HAVE_CUSTOM_HEAP
+ 				mempool_mspace[i] = sceClibMspaceCreate(mempool_addr[i], mempool_size[i]);
+ #else
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -167,6 +167,7 @@
+ 
+ int unsafe_allocator_counter = 0;
+ void *gpu_alloc_mapped_aligned_unsafe_for_cpu(size_t alignment, size_t size) {
++	if (!gxm_context) return NULL; // No scene or collection before context creation.
+ 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
+ 	unsafe_allocator_counter++;
+ 	if (unsafe_allocator_counter == 1) {
+@@ -192,6 +193,7 @@
+ }
+ 
+ void *gpu_alloc_mapped_aligned_unsafe_for_gpu(size_t alignment, size_t size) {
++	if (!gxm_context) return NULL; // No scene or collection before context creation.
+ 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
+ 	unsafe_allocator_counter++;
+ 	if (unsafe_allocator_counter == 1) {
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -236,12 +236,15 @@
+ 
+ 	// Initializing sceGxm
+ 	init_gxm();
++	if (vgl_initialization_error < 0) return GL_FALSE;
+ 
+ 	// Initializing memory heaps for CDRAM and RAM memory (both standard and physically contiguous)
+ 	vgl_mem_init(ram_pool_size, cdram_pool_size, phycont_pool_size, cdlg_pool_size);
++	if (vgl_initialization_error < 0) return GL_FALSE;
+ 
+ 	// Initializing sceGxm context
+ 	init_gxm_context(&gxm_context, VGL_CONTEXT_MAIN);
++	if (vgl_initialization_error < 0 || !gxm_context) return GL_FALSE;
+ 
+ 	// Creating render target for the display
+ 	create_display_render_target();
