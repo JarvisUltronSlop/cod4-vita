@@ -4,6 +4,8 @@ An experimental native PS Vita port of the multiplayer side of [KisakCOD](https:
 
 The current focus is ordinary offline Free-for-All on Shipment. Earlier physical-Vita builds reached roughly **10 FPS**; that is a historical result, not a promise for the current build. At publication, work was focused on recovering reliable Shipment loading after package-decoding failures, preserving menu/error-screen resources, checking matching installed packs, and keeping Shipment textures resident instead of paging them from disk. Crash/Crossfire conversion and larger-map paging exist but remain experimental. Latest-build loading, graphics, memory, reload behavior and performance need hardware validation; campaign, online multiplayer and a complete all-map release are not supported. See [the handoff](docs/STATUS.md) for where to continue.
 
+Demo video: https://youtu.be/A08zMfo94Nk?si=SwCiC1klDWkjEYEn
+
 ## Requirements
 
 - Your own installed **Steam COD4 (2007)** with English game data. The remaster and other Call of Duty games are incompatible.
