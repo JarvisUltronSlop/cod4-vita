@@ -45,6 +45,7 @@
 #include <vita/vita_frontend_texture_lease.h>
 #include <vita/vita_render_settings.h>
 #include <vita/vita_world_depth_order.h>
+#include <vita/vita_world_visibility.h>
 #include <vita/vita_input.h>
 #include <vita/vita_rawfile_bundle.h>
 #include <vita/vita_environment.h>
@@ -736,6 +737,7 @@ struct ShipmentPreview {
     // share one five-frame stream sized for the larger authored mesh.
     std::array<NativeViewModelStream, kNativeViewModelStreamCount> nativeViewModelStreams{};
     std::vector<uint32_t> visibleWorldSurfaces;
+    kisak::vita::VitaWorldDrawOrder worldDrawOrder;
     kisak::vita::VitaDepthScratch worldDepthRanges;
     std::vector<float> rawPositions;
     // The retail lit pixel shader consumes the authored specular map after
@@ -1168,6 +1170,7 @@ void DestroyShipmentTextures(const GfxBackendApi* gfx, ShipmentPreview* preview)
     preview->nativeStaticModelInstances = GfxBufferHandle{0};
     preview->nativeStaticModelChunks.clear();
     preview->worldDepthRanges.Clear();
+    preview->worldDrawOrder.Clear();
     preview->visibleWorldSurfaces.clear();
     if (!gfx->DestroyTexture)
         return;
@@ -1467,6 +1470,7 @@ void LoadShipmentTextures(const GfxBackendApi* gfx, ShipmentPreview* preview,
     if (!gfx || !preview || !images || !materials || !images->Loaded()
         || !materials->Loaded() || !gfx->CreateTexture2D)
         return;
+    preview->worldDrawOrder.Invalidate();
     struct CachedTexture {
         std::string name;
         GfxTextureHandle handle{0};
@@ -3058,6 +3062,7 @@ void LoadShipmentLightmaps(const GfxBackendApi* gfx, ShipmentPreview* preview,
     if (!gfx || !preview || !images || !images->Loaded()
         || !gfx->CreateTexture2D)
         return;
+    preview->worldDrawOrder.Invalidate();
     const bool softwareFallback = GfxVita_IsSoftwareFallback();
     const bool largeMap = softwareFallback
         && preview->vertices.size() > 120'000u;
@@ -9100,6 +9105,8 @@ bool PrepareNativeWorldArchive(const GfxBackendApi* gfx,
     preview->sourceSurfaceBounds = std::move(archiveBounds);
     preview->visibleWorldSurfaces.clear();
     preview->visibleWorldSurfaces.reserve(preview->surfaces.size());
+    preview->worldDrawOrder.Invalidate();
+    preview->worldDrawOrder.Prepare(preview->surfaces.data(), preview->surfaces.size());
     preview->nativeArchive.ready = true;
 
     preview->nativeArchive.residentBytes = vertexBytes + indexBytes;
@@ -10282,72 +10289,6 @@ NativeViewFrustum BuildNativeViewFrustum(
     return result;
 }
 
-bool NativeBoundsVisible(const NativeViewFrustum& frustum,
-                         const ShipmentSourceBounds& bounds) {
-    if (!bounds.valid)
-        return true;
-    const float center[3] = {
-        (bounds.minimum[0] + bounds.maximum[0]) * 0.5f,
-        (bounds.minimum[1] + bounds.maximum[1]) * 0.5f,
-        (bounds.minimum[2] + bounds.maximum[2]) * 0.5f,
-    };
-    const float extent[3] = {
-        (bounds.maximum[0] - bounds.minimum[0]) * 0.5f,
-        (bounds.maximum[1] - bounds.minimum[1]) * 0.5f,
-        (bounds.maximum[2] - bounds.minimum[2]) * 0.5f,
-    };
-    const auto Dot = [](const float left[3], const float right[3]) {
-        return left[0] * right[0] + left[1] * right[1]
-            + left[2] * right[2];
-    };
-    const auto Outside = [&](float nx, float ny, float nz, float d) {
-        const float distance = nx * center[0] + ny * center[1]
-            + nz * center[2] + d;
-        const float radius = std::fabs(nx) * extent[0]
-            + std::fabs(ny) * extent[1] + std::fabs(nz) * extent[2];
-        return distance + radius < 0.0f;
-    };
-    if (Outside(frustum.forward[0], frustum.forward[1], frustum.forward[2],
-                -frustum.eyeForward - frustum.nearDistance)
-        || Outside(-frustum.forward[0], -frustum.forward[1],
-                   -frustum.forward[2],
-                   frustum.eyeForward + frustum.farDistance))
-        return false;
-    const float left[3] = {
-        frustum.forward[0]
-            + frustum.right[0] * frustum.horizontalScale,
-        frustum.forward[1]
-            + frustum.right[1] * frustum.horizontalScale,
-        frustum.forward[2]
-            + frustum.right[2] * frustum.horizontalScale,
-    };
-    const float right[3] = {
-        frustum.forward[0]
-            - frustum.right[0] * frustum.horizontalScale,
-        frustum.forward[1]
-            - frustum.right[1] * frustum.horizontalScale,
-        frustum.forward[2]
-            - frustum.right[2] * frustum.horizontalScale,
-    };
-    const float bottom[3] = {
-        frustum.forward[0] + frustum.up[0] * frustum.verticalScale,
-        frustum.forward[1] + frustum.up[1] * frustum.verticalScale,
-        frustum.forward[2] + frustum.up[2] * frustum.verticalScale,
-    };
-    const float top[3] = {
-        frustum.forward[0] - frustum.up[0] * frustum.verticalScale,
-        frustum.forward[1] - frustum.up[1] * frustum.verticalScale,
-        frustum.forward[2] - frustum.up[2] * frustum.verticalScale,
-    };
-    const auto PlaneD = [&](const float normal[3]) {
-        return -Dot(normal, frustum.eye);
-    };
-    return !Outside(left[0], left[1], left[2], PlaneD(left))
-        && !Outside(right[0], right[1], right[2], PlaneD(right))
-        && !Outside(bottom[0], bottom[1], bottom[2], PlaneD(bottom))
-        && !Outside(top[0], top[1], top[2], PlaneD(top));
-}
-
 float NativeMinimumDistanceToBounds(const float eye[3],
                                     const ShipmentSourceBounds& bounds) {
     if (!bounds.valid)
@@ -10421,6 +10362,7 @@ bool DrawNativeStaticModelArchive(
 #endif
     const NativeViewFrustum frustum = BuildNativeViewFrustum(
         player, fovDegrees);
+    const kisak::vita::VitaWorldFrustum visibility(frustum);
     const ShipmentSurface* previous = nullptr;
     uint32_t submitted = 0;
 #if KISAK_VITA_BENCHMARK
@@ -10437,7 +10379,7 @@ bool DrawNativeStaticModelArchive(
       for (const NativeStaticModelBatch& batch : chunk.batches) {
         ++totalBatches;
         totalInstances += batch.placementCount;
-        if (!NativeBoundsVisible(frustum, batch.bounds))
+        if (!visibility.Visible(batch.bounds))
             continue;
         if (NativeSelectedStaticModelLod(frustum, batch)
                 != static_cast<int32_t>(batch.lodIndex))
@@ -10563,7 +10505,10 @@ bool DrawNativeWorld(const GfxBackendApi* gfx, ShipmentPreview* preview,
         return false;
     const NativeViewFrustum frustum = BuildNativeViewFrustum(player, fovDegrees);
     const float kNear = frustum.nearDistance;
-    const float kFar = frustum.farDistance;
+#if KISAK_VITA_SOURCE_RUNTIME
+    gfx->SetWorldViewProjection(
+        kisak::vita::VitaSourceRender_Packet().viewProjection, kNear);
+#else
     const VitaProjection projection{frustum.horizontalScale, frustum.verticalScale};
     const float* forward = frustum.forward;
     const float* right = frustum.right;
@@ -10575,10 +10520,6 @@ bool DrawNativeWorld(const GfxBackendApi* gfx, ShipmentPreview* preview,
     const float eyeForward = Dot(forward, eye);
     const float eyeRight = Dot(right, eye);
     const float eyeUp = Dot(up, eye);
-#if KISAK_VITA_SOURCE_RUNTIME
-    gfx->SetWorldViewProjection(
-        kisak::vita::VitaSourceRender_Packet().viewProjection, kNear);
-#else
     float matrix[16]{};
     matrix[0] = right[0] * projection.horizontalScale;
     matrix[4] = right[1] * projection.horizontalScale;
@@ -10601,95 +10542,10 @@ bool DrawNativeWorld(const GfxBackendApi* gfx, ShipmentPreview* preview,
     gfx->SetWorldViewProjection(matrix, kNear);
 #endif
 
-    const auto OutsidePlane = [](const ShipmentSourceBounds& bounds,
-                                 float nx, float ny, float nz, float d) {
-        if (!bounds.valid)
-            return false;
-        const float center[3] = {
-            (bounds.minimum[0] + bounds.maximum[0]) * 0.5f,
-            (bounds.minimum[1] + bounds.maximum[1]) * 0.5f,
-            (bounds.minimum[2] + bounds.maximum[2]) * 0.5f,
-        };
-        const float extent[3] = {
-            (bounds.maximum[0] - bounds.minimum[0]) * 0.5f,
-            (bounds.maximum[1] - bounds.minimum[1]) * 0.5f,
-            (bounds.maximum[2] - bounds.minimum[2]) * 0.5f,
-        };
-        const float distance = nx * center[0] + ny * center[1]
-            + nz * center[2] + d;
-        const float radius = std::fabs(nx) * extent[0]
-            + std::fabs(ny) * extent[1] + std::fabs(nz) * extent[2];
-        return distance + radius < 0.0f;
-    };
-    const auto SurfaceVisible = [&](const ShipmentSourceBounds& bounds) {
-        const auto Rejected = [&](float nx, float ny, float nz, float d) {
-            return OutsidePlane(bounds, nx, ny, nz, d);
-        };
-        const float hx = projection.horizontalScale;
-        const float vy = projection.verticalScale;
-        if (Rejected(forward[0], forward[1], forward[2],
-                     -eyeForward - kNear)
-            || Rejected(-forward[0], -forward[1], -forward[2],
-                        eyeForward + kFar))
-            return false;
-        const float left[3] = {forward[0] + right[0] * hx,
-                               forward[1] + right[1] * hx,
-                               forward[2] + right[2] * hx};
-        const float rightPlane[3] = {forward[0] - right[0] * hx,
-                                     forward[1] - right[1] * hx,
-                                     forward[2] - right[2] * hx};
-        const float bottom[3] = {forward[0] + up[0] * vy,
-                                 forward[1] + up[1] * vy,
-                                 forward[2] + up[2] * vy};
-        const float top[3] = {forward[0] - up[0] * vy,
-                              forward[1] - up[1] * vy,
-                              forward[2] - up[2] * vy};
-        return !Rejected(left[0], left[1], left[2], -Dot(left, eye))
-            && !Rejected(rightPlane[0], rightPlane[1], rightPlane[2],
-                         -Dot(rightPlane, eye))
-            && !Rejected(bottom[0], bottom[1], bottom[2], -Dot(bottom, eye))
-            && !Rejected(top[0], top[1], top[2], -Dot(top, eye));
-    };
-
     const uint64_t visibilityStart = sceKernelGetProcessTimeWide();
-    preview->visibleWorldSurfaces.clear();
-    for (uint32_t index = 0; index < preview->surfaces.size(); ++index) {
-        const ShipmentSurface& surface = preview->surfaces[index];
-        if (surface.cameraRegion == 3u || surface.mode == GfxSurfaceMode::Sky
-            || surface.vertexCount == 0 || surface.triangleCount == 0)
-            continue;
-        if (index < preview->sourceSurfaceBounds.size()
-            && !SurfaceVisible(preview->sourceSurfaceBounds[index]))
-            continue;
-        preview->visibleWorldSurfaces.push_back(index);
-    }
-    std::sort(preview->visibleWorldSurfaces.begin(),
-              preview->visibleWorldSurfaces.end(),
-              [&](uint32_t leftIndex, uint32_t rightIndex) {
-        const ShipmentSurface& left = preview->surfaces[leftIndex];
-        const ShipmentSurface& rightSurface = preview->surfaces[rightIndex];
-        const uint64_t leftPhase = static_cast<uint8_t>(left.mode);
-        const uint64_t rightPhase = static_cast<uint8_t>(rightSurface.mode);
-        if (leftPhase != rightPhase)
-            return leftPhase < rightPhase;
-        if (left.sourceTechniqueFlags0 != rightSurface.sourceTechniqueFlags0)
-            return left.sourceTechniqueFlags0
-                < rightSurface.sourceTechniqueFlags0;
-        if (left.sourceStateBits0 != rightSurface.sourceStateBits0)
-            return left.sourceStateBits0 < rightSurface.sourceStateBits0;
-        if (left.sourceStateBits1 != rightSurface.sourceStateBits1)
-            return left.sourceStateBits1 < rightSurface.sourceStateBits1;
-        if (left.texture.value != rightSurface.texture.value)
-            return left.texture.value < rightSurface.texture.value;
-        if (left.lightmapTexture.value != rightSurface.lightmapTexture.value)
-            return left.lightmapTexture.value
-                < rightSurface.lightmapTexture.value;
-        if (left.secondaryLightmapTexture.value
-            != rightSurface.secondaryLightmapTexture.value)
-            return left.secondaryLightmapTexture.value
-                < rightSurface.secondaryLightmapTexture.value;
-        return leftIndex < rightIndex;
-    });
+    const kisak::vita::VitaWorldFrustum visibility(frustum);
+    preview->worldDrawOrder.Collect(preview->surfaces, preview->sourceSurfaceBounds,
+        visibility, preview->visibleWorldSurfaces);
 
 #if KISAK_VITA_CPU_RUNTIME && KISAK_VITA_SOURCE_RUNTIME
     if(depthOrderPhase) {
@@ -19075,6 +18931,7 @@ bool LoadWorldPreview(const kisak::vita::VitaAssetDatabase& database,
                       ShipmentPreview* preview, uint64_t assetId = 0) {
     if (!preview)
         return false;
+    preview->worldDrawOrder.Clear();
     constexpr uint32_t kWorldMagic = 0x57544956; // "VITW"
     constexpr uint32_t kWorldVersionV1 = 1;
     constexpr uint32_t kWorldVersionV2 = 2;

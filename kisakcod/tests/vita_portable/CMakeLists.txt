@@ -275,6 +275,25 @@ target_link_libraries(vita-cpu-tls-tests PRIVATE Threads::Threads)
 add_test(NAME vita-cpu-tls-isolation COMMAND vita-cpu-tls-tests)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+foreach(part types draw)
+    set(world_visibility_${part} "${CMAKE_CURRENT_BINARY_DIR}/world_visibility_${part}.inc")
+    add_custom_command(OUTPUT "${world_visibility_${part}}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/vita_asset_prep/extract_cpu_optimization_test.py"
+            --kind "world-visibility-${part}" --source "${CMAKE_CURRENT_SOURCE_DIR}/../../src/vita/vita_bootstrap.cpp"
+            --output "${world_visibility_${part}}"
+        DEPENDS ../../tools/vita_asset_prep/extract_cpu_optimization_test.py ../../src/vita/vita_bootstrap.cpp
+        VERBATIM)
+endforeach()
+foreach(source_runtime 0 1)
+    set(visibility_target "vita-world-visibility-${source_runtime}-tests")
+    add_executable(${visibility_target} world_visibility_tests.cpp
+        "${world_visibility_types}" "${world_visibility_draw}")
+    target_compile_features(${visibility_target} PRIVATE cxx_std_20)
+    target_compile_definitions(${visibility_target} PRIVATE
+        KISAK_VITA_SOURCE_RUNTIME=${source_runtime} KISAK_VITA_CPU_RUNTIME=1 KISAK_VITA_BENCHMARK=0)
+    target_include_directories(${visibility_target} PRIVATE ../../src "${CMAKE_CURRENT_BINARY_DIR}")
+    add_test(NAME "vita-world-visibility-${source_runtime}-parity" COMMAND ${visibility_target})
+endforeach()
 set(session_stop_header "${CMAKE_CURRENT_BINARY_DIR}/source_session_stop.inc")
 add_custom_command(OUTPUT "${session_stop_header}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/vita_asset_prep/extract_cpu_optimization_test.py"
