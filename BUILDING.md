@@ -43,3 +43,18 @@ python tools/audit_public_source.py
 ```
 
 Some integration probes need locally converted data; some historical source-text assertions may be stale. Host parser success does not establish source-VM/gameplay parity or physical performance. See [STATUS.md](docs/STATUS.md).
+
+### World visibility regression test
+
+This harness compiles the current `DrawNativeWorld` function against a recording graphics backend and compares it with the version from `e9ef7f1`. It checks draw commands and visibility for both camera paths, including material changes, clipping boundaries and cache allocation failure. No game assets or VitaSDK are needed.
+
+For a single-configuration generator such as Ninja:
+
+```sh
+cmake -S kisakcod/tests/vita_portable -B build/visibility -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/visibility --target vita-world-visibility-0-tests vita-world-visibility-1-tests
+ctest --test-dir build/visibility -R vita-world-visibility --output-on-failure
+./build/visibility/vita-world-visibility-1-tests --benchmark
+```
+
+The benchmark reports microseconds per synthetic frame, the one-time order-build cost and cache bytes. It tests sorted and shuffled material order at three surface counts and two fields of view. Each timing is the median of nine 240-frame camera sweeps, with alternating baseline/candidate runs after warmup. Graphics calls are stubs, so these are host CPU timings, not Vita frame rates. On-device checks still need matching content, graphics settings and clocks.

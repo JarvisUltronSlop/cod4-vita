@@ -6,14 +6,20 @@ import re
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source',type=Path,required=True)
 p.add_argument('--output',type=Path,required=True)
-p.add_argument('--kind',choices=['lighting','terrain','audio','residency','session-stop','initial-join','primary-lights','package-probe'],required=True)
+p.add_argument('--kind',choices=['lighting','terrain','audio','residency','session-stop','initial-join','primary-lights','package-probe','world-visibility-types','world-visibility-draw'],required=True)
 a=p.parse_args();s=a.source.read_text(encoding='utf-8')
 def extract(start):
     end=s.index('{',start)+1;depth=1
     while depth:
         depth+=(s[end]=='{')-(s[end]=='}');end+=1
     return s[start:end]
-if a.kind=='package-probe':
+if a.kind=='world-visibility-types':
+    parts=[extract(s.index('struct '+name+' {'))+';' for name in
+           ['ShipmentSurface','ShipmentSourceBounds','NativeViewFrustum','VitaProjection']]
+elif a.kind=='world-visibility-draw':
+    parts=[extract(s.rindex('bool '+name+'(')) for name in
+           ['SameNativeWorldState','DrawNativeWorld']]
+elif a.kind=='package-probe':
     parts=[extract(s.index('bool ProbePackage('))]
 elif a.kind=='primary-lights':
     parts=[extract(s.index('bool LoadShipmentPrimaryLights('))]
